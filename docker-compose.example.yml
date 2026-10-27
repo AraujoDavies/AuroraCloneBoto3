@@ -1,0 +1,15 @@
+# Exemplo: copie para docker-compose.yml
+# Uso: docker compose run --rm aurora-clone
+# Shell interativo com o projeto montado em /app (código, .env, dumps).
+
+services:
+  aurora-clone:
+    build: .
+    env_file:
+      - .env
+    volumes:
+      - .:/app
+    working_dir: /app
+    stdin_open: true
+    tty: true
+    command: ["bash"]
