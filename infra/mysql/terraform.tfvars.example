@@ -1,0 +1,19 @@
+# Copy to terraform.tfvars and fill in secrets:
+#   cp terraform.tfvars.example terraform.tfvars
+
+aws_region   = "us-east-1"
+deploy_mode  = "prod" # or "prod_dev"
+
+prod_cluster_identifier = "prod-aurora"
+dev_cluster_identifier  = "dev-aurora"
+
+master_username = "labadmin"
+master_password = "CHANGE-ME-strong-password"
+
+# Prefer your public IP, e.g. "203.0.113.10/32"
+allowed_cidr = "0.0.0.0/0"
+
+# Optional Serverless v2 knobs (defaults are cheapest lab settings)
+# min_capacity             = 0
+# max_capacity             = 1
+# seconds_until_auto_pause = 600
