@@ -2,6 +2,8 @@ __pycache__/
 .env
 .venv/
 dumps/
+.aurora_game_checkpoint
+policy.json
 .DS_Store
 .idea/
 .pytest_cache/

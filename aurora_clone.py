@@ -38,30 +38,64 @@ SYSTEM_SCHEMAS = frozenset(
 )
 
 
+def mask_account_id(account: str | None) -> str:
+    """Mascarar account id de 12 dígitos: 123***789."""
+    account = (account or "").strip()
+    if len(account) >= 6:
+        return f"{account[:3]}***{account[-3:]}"
+    return "***" if account else "***"
+
+
+def mask_account_in_text(text: str | None, account: str | None) -> str:
+    """Substitui o account id completo em ARNs/textos pelo valor mascarado."""
+    raw = text or ""
+    acct = (account or "").strip()
+    if not raw or not acct:
+        return raw
+    return raw.replace(acct, mask_account_id(acct))
+
+
+def _aws_session(region: str) -> boto3.Session:
+    """Sessão boto3 isolada; credenciais explícitas do env evitam cache da sessão padrão."""
+    kwargs: dict[str, str] = {"region_name": region}
+    access_key = (os.getenv("AWS_ACCESS_KEY_ID") or "").strip()
+    secret_key = (os.getenv("AWS_SECRET_ACCESS_KEY") or "").strip()
+    if access_key and secret_key:
+        kwargs["aws_access_key_id"] = access_key
+        kwargs["aws_secret_access_key"] = secret_key
+        session_token = (os.getenv("AWS_SESSION_TOKEN") or "").strip()
+        if session_token:
+            kwargs["aws_session_token"] = session_token
+    return boto3.Session(**kwargs)
+
+
 class AuroraClone:
     """Orquestra o clone Aurora PROD → DEV (passos 1–7)."""
 
     def __init__(self, region_name: str | None = None):
-        region = region_name or os.getenv("AWS_DEFAULT_REGION") or os.getenv("AWS_REGION")
-        try:
-            self.rds = (
-                boto3.client("rds", region_name=region)
-                if region
-                else boto3.client("rds")
+        region = (
+            (region_name or "").strip()
+            or (os.getenv("AWS_DEFAULT_REGION") or "").strip()
+            or (os.getenv("AWS_REGION") or "").strip()
+            or None
+        )
+        if not region:
+            raise RuntimeError(
+                "Faltam variáveis de ambiente no .env: AWS_DEFAULT_REGION "
+                "(ou AWS_REGION). Edite o .env e tente de novo."
             )
+        session = _aws_session(region)
+        try:
+            self.rds = session.client("rds", region_name=region)
         except Exception as error:
             raise RuntimeError(f"boto3 RDS Failed: {error}") from error
         try:
-            self.iam = boto3.client("iam")
-            self.sts = boto3.client("sts")
+            self.iam = session.client("iam")
+            self.sts = session.client("sts")
         except Exception as error:
             raise RuntimeError(f"boto3 IAM/STS Failed: {error}") from error
         try:
-            self.ssm = (
-                boto3.client("ssm", region_name=region)
-                if region
-                else boto3.client("ssm")
-            )
+            self.ssm = session.client("ssm", region_name=region)
         except Exception as error:
             raise RuntimeError(f"boto3 SSM Failed: {error}") from error
         self.region = self.rds.meta.region_name
@@ -77,10 +111,8 @@ class AuroraClone:
             for sg in (os.getenv("VPC_SECURITY_GROUP_IDS") or "").split(",")
             if sg.strip()
         ]
-        self.db_instance_class = (
-            os.getenv("DB_INSTANCE_CLASS") or "db.serverless"
-        ).strip()
-        self.engine = (os.getenv("ENGINE") or "aurora-mysql").strip()
+        # Opcional: se vazio, clone herda do writer DEV (fallback db.serverless).
+        self.db_instance_class = (os.getenv("DB_INSTANCE_CLASS") or "").strip()
 
         self.db_user = (os.getenv("DB_USER") or "").strip()
         self.db_password = os.getenv("DB_PASSWORD") or ""
@@ -160,17 +192,9 @@ class AuroraClone:
 
     def _resolve_db_user(self) -> None:
         """
-        DB_USER do env, ou default ao master se DEV==PROD.
-        Se masters diferem e DB_USER vazio → erro cedo.
+        DB_USER do env, ou default ao MasterUsername do DEV.
+        Não consulta o cluster PROD.
         """
-        self._require_env("PROD_IDENTIFIER", "DEV_IDENTIFIER")
-        master_prod = self._cluster_master_username(self.prod_id)
-        master_dev = self._cluster_master_username(self.dev_id)
-        logging.info(
-            "MasterUsername PROD=%s DEV=%s",
-            master_prod,
-            master_dev,
-        )
         if self.db_user:
             if not re.fullmatch(r"[A-Za-z0-9_]+", self.db_user):
                 raise ValueError(
@@ -179,16 +203,12 @@ class AuroraClone:
                 )
             logging.info("DB_USER=%s (fonte=env).", self.db_user)
             return
-        if master_dev == master_prod:
-            self.db_user = master_prod
-            logging.info(
-                "DB_USER omitido; masters DEV/PROD iguais, usando %s.",
-                self.db_user,
-            )
-            return
-        raise RuntimeError(
-            "DB_USER é obrigatório: MasterUsername DEV "
-            f"({master_dev}) ≠ PROD ({master_prod})."
+        self._require_env("DEV_IDENTIFIER")
+        master_dev = self._cluster_master_username(self.dev_id, role="DEV")
+        self.db_user = master_dev
+        logging.info(
+            "DB_USER omitido; usando MasterUsername DEV=%s.",
+            self.db_user,
         )
 
     def _resolve_db_credentials(self) -> None:
@@ -198,6 +218,43 @@ class AuroraClone:
         self._resolve_db_password()
         self._resolve_db_user()
         self._db_credentials_resolved = True
+
+    def verify_dev_login(self) -> dict:
+        """
+        Resolve credenciais e testa login MySQL no writer do DEV.
+        Retorna host/user (sem senha). Falha com RuntimeError se connect falhar.
+        """
+        self._require_env("DEV_IDENTIFIER")
+        self._resolve_db_credentials()
+        if not self.db_password:
+            raise RuntimeError("DB_PASSWORD ficou vazia após resolve.")
+        host = self._cluster_endpoint(self.dev_id, role="DEV")
+        try:
+            with self._mysql_connect(host) as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT 1 AS ok")
+                    row = cur.fetchone() or {}
+                if row.get("ok") != 1:
+                    raise RuntimeError(
+                        f"Smoke login DEV {self.dev_id} respondeu sem ok=1."
+                    )
+        except pymysql.Error as error:
+            raise RuntimeError(
+                f"Falha ao conectar no DEV ({self.dev_id} @ {host}) "
+                f"como {self.db_user!r}: {error}. "
+                "Confira DB_USER/DB_PASSWORD e rede/SG."
+            ) from error
+        logging.info(
+            "Smoke login DEV ok (cluster=%s user=%s host=%s).",
+            self.dev_id,
+            self.db_user,
+            host,
+        )
+        return {
+            "cluster": self.dev_id,
+            "host": host,
+            "user": self.db_user,
+        }
 
     def _assert_not_prod(self, identifier: str, action: str) -> None:
         """Bloqueia rename/delete se o alvo for PROD."""
@@ -290,15 +347,49 @@ class AuroraClone:
             f"Timeout aguardando instância {identifier} → {desired}"
         )
 
-    def _cluster_endpoint(self, identifier: str) -> str:
-        response = self.rds.describe_db_clusters(DBClusterIdentifier=identifier)
+    def _cluster_not_found_message(self, identifier: str, role: str | None) -> str:
+        if role == "DEV":
+            return (
+                f"Cluster do banco de dados de DEV ({identifier}) "
+                "não foi encontrado!"
+            )
+        if role == "PROD":
+            return (
+                f"Cluster do banco de dados de PROD ({identifier}) "
+                "não foi encontrado! Confira PROD_IDENTIFIER no .env "
+                "e se o cluster existe na região."
+            )
+        if role == "TEMP":
+            return (
+                f"Cluster do banco de dados de TEMP ({identifier}) "
+                "não foi encontrado!"
+            )
+        return f"Cluster do banco de dados ({identifier}) não foi encontrado!"
+
+    def _describe_db_cluster(self, identifier: str, *, role: str | None = None):
+        try:
+            response = self.rds.describe_db_clusters(
+                DBClusterIdentifier=identifier
+            )
+        except ClientError as error:
+            if error.response["Error"]["Code"] == "DBClusterNotFoundFault":
+                raise RuntimeError(
+                    self._cluster_not_found_message(identifier, role)
+                ) from error
+            raise
+        return response
+
+    def _cluster_endpoint(self, identifier: str, *, role: str | None = None) -> str:
+        response = self._describe_db_cluster(identifier, role=role)
         endpoint = response["DBClusters"][0].get("Endpoint")
         if not endpoint:
             raise RuntimeError(f"Cluster {identifier} sem Endpoint writer.")
         return endpoint
 
-    def _cluster_master_username(self, identifier: str) -> str:
-        response = self.rds.describe_db_clusters(DBClusterIdentifier=identifier)
+    def _cluster_master_username(
+        self, identifier: str, *, role: str | None = None
+    ) -> str:
+        response = self._describe_db_cluster(identifier, role=role)
         username = (response["DBClusters"][0].get("MasterUsername") or "").strip()
         if not username:
             raise RuntimeError(f"Cluster {identifier} sem MasterUsername.")
@@ -588,12 +679,14 @@ class AuroraClone:
     # ------------------------------------------------------------------
 
     def log_caller_identity(self) -> dict:
-        """Loga conta/ARN em uso (útil depois de trocar access key)."""
+        """Loga conta/ARN em uso (account mascarado nos logs)."""
         identity = self.sts.get_caller_identity()
+        account = identity.get("Account") or ""
+        arn = identity.get("Arn") or ""
         logging.info(
             "AWS identity: Account=%s | Arn=%s | região=%s",
-            identity.get("Account"),
-            identity.get("Arn"),
+            mask_account_id(account),
+            mask_account_in_text(arn, account),
             self.region,
         )
         return identity
@@ -609,7 +702,9 @@ class AuroraClone:
 
     def _caller_has_policy_attached(self, policy_arn: str) -> bool:
         """True se a identity atual (role ou user) tem a policy anexada."""
-        caller_arn = self.sts.get_caller_identity()["Arn"]
+        identity = self.sts.get_caller_identity()
+        caller_arn = identity["Arn"]
+        account = identity.get("Account") or ""
         if ":assumed-role/" in caller_arn:
             role_name = caller_arn.split(":assumed-role/")[1].split("/")[0]
             paginator = self.iam.get_paginator("list_attached_role_policies")
@@ -627,7 +722,8 @@ class AuroraClone:
                         return True
             return False
         logging.warning(
-            "Identity atual não é role nem user IAM reconhecível: %s", caller_arn
+            "Identity atual não é role nem user IAM reconhecível: %s",
+            mask_account_in_text(caller_arn, account),
         )
         return False
 
@@ -664,10 +760,11 @@ class AuroraClone:
         policy_arn = policy.get("Arn")
         result["exists"] = True
         result["policy_arn"] = policy_arn
+        account = (self.sts.get_caller_identity().get("Account") or "").strip()
         logging.info(
             "Policy '%s': encontrada. ARN=%s | AttachmentCount=%s | DefaultVersion=%s",
             policy_name,
-            policy_arn,
+            mask_account_in_text(policy_arn, account),
             policy.get("AttachmentCount"),
             policy.get("DefaultVersionId"),
         )
@@ -750,30 +847,118 @@ class AuroraClone:
             return False
         raise RuntimeError(
             f"{key}={raw!r} inválido. Use true/false, 1/0, yes/no ou on/off "
-            "(ou omita para herdar do writer PROD)."
+            "(ou omita para herdar do writer DEV)."
         )
 
     def _resolve_temp_publicly_accessible(
-        self, prod_cluster: dict
+        self, dev_cluster: dict
     ) -> tuple[bool, str]:
         """
         Resolve PubliclyAccessible para a instância TEMP.
 
         Returns:
-            (valor, origem) onde origem é "env" ou "prod".
+            (valor, origem) onde origem é "env" ou "dev".
         """
         override = self._parse_optional_env_bool("DEV_PUBLICLY_ACCESSIBLE")
         if override is not None:
             return override, "env"
 
-        _, _, publicly_accessible = self._writer_instance_info(prod_cluster)
+        _, _, publicly_accessible = self._writer_instance_info(dev_cluster)
         if publicly_accessible is None:
             logging.warning(
-                "PubliclyAccessible do writer PROD indisponível; "
+                "PubliclyAccessible do writer DEV indisponível; "
                 "usando False no TEMP (seguro)."
             )
-            return False, "prod"
-        return publicly_accessible, "prod"
+            return False, "dev"
+        return publicly_accessible, "dev"
+
+    def _resolve_temp_placement(
+        self, prod_cluster: dict, dev_cluster: dict
+    ) -> dict:
+        """
+        Resolve subnet/SG/class/engine/public do TEMP.
+
+        Env override quando setado; rede/porte do DEV; Engine sempre do PROD.
+        """
+        if self.db_subnet_group:
+            subnet_group = self.db_subnet_group
+            subnet_origem = "env"
+        else:
+            subnet_group = (dev_cluster.get("DBSubnetGroup") or "").strip()
+            subnet_origem = "dev"
+            if not subnet_group:
+                raise RuntimeError(
+                    "DB_SUBNET_GROUP não setado e cluster DEV sem DBSubnetGroup. "
+                    "Defina DB_SUBNET_GROUP ou confira o DEV."
+                )
+
+        if self.vpc_security_group_ids:
+            sg_ids = list(self.vpc_security_group_ids)
+            sg_origem = "env"
+        else:
+            sg_ids = self._sg_ids_from_resource(dev_cluster)
+            sg_origem = "dev"
+            if not sg_ids:
+                raise RuntimeError(
+                    "VPC_SECURITY_GROUP_IDS não setado e cluster DEV sem "
+                    "VpcSecurityGroups. Defina VPC_SECURITY_GROUP_IDS ou "
+                    "confira o DEV."
+                )
+
+        if self.db_instance_class:
+            instance_class = self.db_instance_class
+            class_origem = "env"
+        else:
+            _, writer_class, _ = self._writer_instance_info(dev_cluster)
+            if writer_class:
+                instance_class = writer_class
+                class_origem = "dev"
+            else:
+                instance_class = "db.serverless"
+                class_origem = "default"
+                logging.warning(
+                    "DBInstanceClass do writer DEV indisponível; "
+                    "usando db.serverless no TEMP."
+                )
+
+        engine = (prod_cluster.get("Engine") or "").strip()
+        if not engine:
+            raise RuntimeError(
+                f"Cluster PROD ({self.prod_id}) sem Engine; "
+                "não é possível criar a writer TEMP."
+            )
+
+        publicly_accessible, publico_origem = (
+            self._resolve_temp_publicly_accessible(dev_cluster)
+        )
+
+        placement = {
+            "subnet_group": subnet_group,
+            "subnet_origem": subnet_origem,
+            "vpc_security_group_ids": sg_ids,
+            "sg_origem": sg_origem,
+            "instance_class": instance_class,
+            "class_origem": class_origem,
+            "engine": engine,
+            "engine_origem": "prod",
+            "publicly_accessible": publicly_accessible,
+            "publico_origem": publico_origem,
+        }
+        logging.info(
+            "TEMP placement: subnet=%s (%s) sg=%s (%s) class=%s (%s) "
+            "engine=%s (%s) publico=%s (%s)",
+            placement["subnet_group"],
+            placement["subnet_origem"],
+            ",".join(placement["vpc_security_group_ids"]),
+            placement["sg_origem"],
+            placement["instance_class"],
+            placement["class_origem"],
+            placement["engine"],
+            placement["engine_origem"],
+            self._publico_label(placement["publicly_accessible"]),
+            placement["publico_origem"],
+        )
+        return placement
 
     @staticmethod
     def _sg_ids_from_resource(resource: dict) -> list[str]:
@@ -874,6 +1059,7 @@ class AuroraClone:
             result.append(item)
             logging.info(
                 "Cluster %s\n"
+                "  identifier:      %s\n"
                 "  status:          %s\n"
                 "  engine:          %s (%s)\n"
                 "  region:          %s\n"
@@ -884,6 +1070,7 @@ class AuroraClone:
                 "  publico:         %s\n"
                 "  master_user:     %s\n"
                 "  endpoint:        %s",
+                item["identifier"],
                 item["identifier"],
                 item["status"],
                 item["engine"],
@@ -911,8 +1098,6 @@ class AuroraClone:
             "PROD_IDENTIFIER",
             "DEV_IDENTIFIER",
             "TEMP_IDENTIFIER",
-            "DB_SUBNET_GROUP",
-            "VPC_SECURITY_GROUP_IDS",
             "DB_PASSWORD",
         )
         if self._cluster_exists(self.temp_id):
@@ -920,16 +1105,21 @@ class AuroraClone:
                 f"TEMP já existe ({self.temp_id}). Remova antes de clonar."
             )
 
-        prod_response = self.rds.describe_db_clusters(
-            DBClusterIdentifier=self.prod_id
-        )
+        prod_response = self._describe_db_cluster(self.prod_id, role="PROD")
         prod_cluster = (prod_response.get("DBClusters") or [None])[0]
         if not prod_cluster:
-            raise RuntimeError(f"Cluster PROD não encontrado: {self.prod_id}")
+            raise RuntimeError(
+                self._cluster_not_found_message(self.prod_id, "PROD")
+            )
 
-        publicly_accessible, publico_origem = (
-            self._resolve_temp_publicly_accessible(prod_cluster)
-        )
+        dev_response = self._describe_db_cluster(self.dev_id, role="DEV")
+        dev_cluster = (dev_response.get("DBClusters") or [None])[0]
+        if not dev_cluster:
+            raise RuntimeError(
+                self._cluster_not_found_message(self.dev_id, "DEV")
+            )
+
+        placement = self._resolve_temp_placement(prod_cluster, dev_cluster)
 
         logging.info(
             "Clonando PROD %s → TEMP %s (copy-on-write, latest PITR)...",
@@ -941,25 +1131,28 @@ class AuroraClone:
             SourceDBClusterIdentifier=self.prod_id,
             RestoreType="copy-on-write",
             UseLatestRestorableTime=True,
-            DBSubnetGroupName=self.db_subnet_group,
-            VpcSecurityGroupIds=self.vpc_security_group_ids,
+            DBSubnetGroupName=placement["subnet_group"],
+            VpcSecurityGroupIds=placement["vpc_security_group_ids"],
         )
         self._wait_cluster(self.temp_id, "available")
 
         logging.info(
-            "Criando instância %s (class=%s, engine=%s, publico: %s, origem: %s)...",
+            "Criando instância %s (class=%s/%s, engine=%s/%s, "
+            "publico: %s/%s)...",
             self.temp_id,
-            self.db_instance_class,
-            self.engine,
-            self._publico_label(publicly_accessible),
-            publico_origem,
+            placement["instance_class"],
+            placement["class_origem"],
+            placement["engine"],
+            placement["engine_origem"],
+            self._publico_label(placement["publicly_accessible"]),
+            placement["publico_origem"],
         )
         self.rds.create_db_instance(
             DBInstanceIdentifier=self.temp_id,
             DBClusterIdentifier=self.temp_id,
-            DBInstanceClass=self.db_instance_class,
-            Engine=self.engine,
-            PubliclyAccessible=publicly_accessible,
+            DBInstanceClass=placement["instance_class"],
+            Engine=placement["engine"],
+            PubliclyAccessible=placement["publicly_accessible"],
         )
         self._wait_instance(self.temp_id, "available")
 
@@ -1240,7 +1433,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="command")
 
-    sub.add_parser("account-aws", help="Mostra Account/Arn AWS em uso")
+    sub.add_parser(
+        "account-aws",
+        help="Mostra Account/Arn AWS em uso (account mascarado nos logs)",
+    )
     sub.add_parser("check-policy", help="Checa policy AvoidDeleteAuroraCloneBoto3")
     sub.add_parser("list-rds", help="Lista clusters RDS e engines")
     sub.add_parser("clone-prod-to-temp", help="1. Clone PROD → TEMP")
@@ -1264,12 +1460,13 @@ def main(argv: list[str] | None = None) -> None:
         app.log_caller_identity()
     elif command == "check-policy":
         result = app.check_avoid_delete_policy()
+        account = (app.sts.get_caller_identity().get("Account") or "").strip()
         logging.info(
             "Resultado policy '%s': exists=%s | active=%s | arn=%s",
             result["policy_name"],
             result["exists"],
             result["active"],
-            result["policy_arn"],
+            mask_account_in_text(result["policy_arn"], account),
         )
     elif command == "list-rds":
         clusters = app.list_rds()
