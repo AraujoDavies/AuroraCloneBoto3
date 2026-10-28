@@ -6,15 +6,15 @@ locals {
   name_prefix = "vpc-lab-aurora-clone-boto3-${local.engine_key}"
 
   labs_all = {
-    prod = {
-      role                = "prod"
+    labprod = {
+      role                = "labprod"
       vpc_name            = "${local.name_prefix}-prod"
       vpc_cidr            = "10.20.0.0/16"
       public_subnet_cidrs = ["10.20.0.0/24", "10.20.1.0/24"]
       cluster_identifier  = var.prod_cluster_identifier
     }
-    dev = {
-      role                = "dev"
+    labdev = {
+      role                = "labdev"
       vpc_name            = "${local.name_prefix}-dev"
       vpc_cidr            = "10.21.0.0/16"
       public_subnet_cidrs = ["10.21.0.0/24", "10.21.1.0/24"]
@@ -24,7 +24,7 @@ locals {
 
   labs = {
     for key, lab in local.labs_all : key => lab
-    if key == "prod" || local.create_dev
+    if key == "labprod" || local.create_dev
   }
 
   common_tags = {
