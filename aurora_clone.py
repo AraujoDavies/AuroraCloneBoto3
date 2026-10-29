@@ -1,8 +1,8 @@
 """
 Aurora Clone — versão pública.
 
-Pipeline: clone PROD→TEMP, dump DEV, restore→TEMP, validate,
-rename DEV→OLD / TEMP→DEV, delete OLD.
+Pipeline: clone PROD→TEMP, sanitize TEMP, dump DEV, restore→TEMP,
+validate, rename DEV→OLD / TEMP→DEV, delete OLD.
 Pré-voo: inventário RDS + policy IAM AvoidDeleteAuroraCloneBoto3.
 """
 
@@ -12,6 +12,7 @@ import argparse
 import logging
 import os
 import re
+import shutil
 import subprocess
 import time
 from datetime import datetime
@@ -25,6 +26,10 @@ from dotenv import load_dotenv
 # override=True: após trocar a secret key, o arquivo vence variáveis antigas do shell.
 load_dotenv(override=True)
 
+TEMP_REQUIRED_UNAVAILABLE = (
+    "banco de dados temp, é obrigatório mas não está disponível no momento."
+)
+
 logging.basicConfig(
     level=logging.INFO,
     encoding="utf-8",
@@ -33,6 +38,13 @@ logging.basicConfig(
 
 AVOID_DELETE_POLICY_NAME = "AvoidDeleteAuroraCloneBoto3"
 POLL_INTERVAL_SECONDS = 30
+SANITIZE_RETRY_WAIT_SECONDS = 60
+SANITIZE_LOG_OUTPUT_MAX_BYTES = 32 * 1024
+# Válido em MySQL e PostgreSQL quando SANITIZE_SQL_PATH está vazio.
+SANITIZE_LIST_SCHEMAS_SQL = (
+    "SELECT schema_name FROM information_schema.schemata "
+    "ORDER BY schema_name;"
+)
 SYSTEM_SCHEMAS = frozenset(
     {"mysql", "information_schema", "performance_schema", "sys"}
 )
@@ -70,7 +82,7 @@ def _aws_session(region: str) -> boto3.Session:
 
 
 class AuroraClone:
-    """Orquestra o clone Aurora PROD → DEV (passos 1–7)."""
+    """Orquestra o clone Aurora PROD → DEV (passos 1–8)."""
 
     def __init__(self, region_name: str | None = None):
         region = (
@@ -129,6 +141,9 @@ class AuroraClone:
         self.dump_base_dir = Path(
             (os.getenv("DUMP_BASE_DIR") or "./dumps").strip()
         )
+        self.sanitize_sql_path = (
+            os.getenv("SANITIZE_SQL_PATH") or ""
+        ).strip()
         self.row_diff_tolerance = int(os.getenv("ROW_DIFF_TOLERANCE") or "50")
         self.wait_timeout_seconds = int(
             os.getenv("WAIT_TIMEOUT_SECONDS") or "3600"
@@ -151,6 +166,7 @@ class AuroraClone:
             "DB_USER": self.db_user,
             "DB_PASSWORD": self.db_password,
             "DEV_SCHEMAS": ",".join(self.dev_schemas),
+            "SANITIZE_SQL_PATH": self.sanitize_sql_path,
         }
         missing = []
         for key in keys:
@@ -395,6 +411,180 @@ class AuroraClone:
             raise RuntimeError(f"Cluster {identifier} sem MasterUsername.")
         return username
 
+    def _cluster_engine_and_port(
+        self, identifier: str, *, role: str | None = None
+    ) -> tuple[str, int]:
+        """Engine (lower) e Port do cluster; default de porta por família."""
+        response = self._describe_db_cluster(identifier, role=role)
+        cluster = response["DBClusters"][0]
+        engine = (cluster.get("Engine") or "").strip().lower()
+        if not engine:
+            raise RuntimeError(f"Cluster {identifier} sem Engine.")
+        raw_port = cluster.get("Port")
+        if raw_port is not None:
+            port = int(raw_port)
+        elif self._is_postgres_engine(engine):
+            port = 5432
+        else:
+            port = 3306
+        return engine, port
+
+    @staticmethod
+    def _is_postgres_engine(engine: str) -> bool:
+        return "postgres" in (engine or "").lower()
+
+    @staticmethod
+    def _is_mysql_engine(engine: str) -> bool:
+        eng = (engine or "").lower()
+        return "mysql" in eng or eng == "aurora"
+
+    @staticmethod
+    def _truncate_for_log(
+        text: str, limit: int = SANITIZE_LOG_OUTPUT_MAX_BYTES
+    ) -> str:
+        raw = text or ""
+        if len(raw) <= limit:
+            return raw
+        omitted = len(raw) - limit
+        return raw[:limit] + f"\n... [truncated {omitted} bytes]"
+
+    def _log_sanitize_cli_output(
+        self, label: str, output: str, *, level: int = logging.INFO
+    ) -> None:
+        text = self._truncate_for_log((output or "").strip())
+        if text:
+            logging.log(level, "%s:\n%s", label, text)
+
+    def _run_sanitize_cli(
+        self,
+        *,
+        host: str,
+        port: int,
+        engine: str,
+        sql_path: Path | None = None,
+        sql_statement: str | None = None,
+    ) -> str:
+        """
+        Executa SQL na TEMP via mysql ou psql (arquivo ou statement).
+        Retorna stdout+stderr combinados. Raise se exit ≠ 0.
+        """
+        if (sql_path is None) == (sql_statement is None):
+            raise ValueError(
+                "Informe exatamente um de: sql_path ou sql_statement."
+            )
+
+        env = os.environ.copy()
+
+        if self._is_postgres_engine(engine):
+            if not shutil.which("psql"):
+                raise RuntimeError("Cliente psql não encontrado no PATH.")
+            env["PGPASSWORD"] = self.db_password
+            cmd = [
+                "psql",
+                "-h",
+                host,
+                "-p",
+                str(port),
+                "-U",
+                self.db_user,
+                "-d",
+                "postgres",
+                "-v",
+                "ON_ERROR_STOP=1",
+                "-e",
+            ]
+            if sql_path is not None:
+                cmd.extend(["-f", str(sql_path)])
+                logging.info(
+                    "Sanitize TEMP via psql (%s:%s) file=%s",
+                    host,
+                    port,
+                    sql_path,
+                )
+            else:
+                cmd.extend(["-c", sql_statement or ""])
+                logging.info(
+                    "Sanitize TEMP via psql (%s:%s) statement (list schemas)",
+                    host,
+                    port,
+                )
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                env=env,
+                check=False,
+            )
+        elif self._is_mysql_engine(engine):
+            if not shutil.which("mysql"):
+                raise RuntimeError("Cliente mysql não encontrado no PATH.")
+            cmd = [
+                "mysql",
+                "-h",
+                host,
+                "-P",
+                str(port),
+                "-u",
+                self.db_user,
+                f"-p{self.db_password}",
+                "--batch",
+                "--raw",
+                "-vv",
+            ]
+            if sql_path is not None:
+                logging.info(
+                    "Sanitize TEMP via mysql (%s:%s) file=%s",
+                    host,
+                    port,
+                    sql_path,
+                )
+                with open(sql_path, "rb") as sql_fh:
+                    result = subprocess.run(
+                        cmd,
+                        stdin=sql_fh,
+                        capture_output=True,
+                        text=True,
+                        env=env,
+                        check=False,
+                    )
+            else:
+                cmd.extend(["-e", sql_statement or ""])
+                logging.info(
+                    "Sanitize TEMP via mysql (%s:%s) statement (list schemas)",
+                    host,
+                    port,
+                )
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    env=env,
+                    check=False,
+                )
+        else:
+            raise RuntimeError(
+                f"Engine não suportada para sanitize: {engine!r} "
+                "(esperado mysql/aurora-mysql ou postgres/aurora-postgresql)."
+            )
+
+        combined = "\n".join(
+            part
+            for part in ((result.stdout or ""), (result.stderr or ""))
+            if part
+        )
+        if result.returncode != 0:
+            self._log_sanitize_cli_output(
+                "Sanitize CLI output (falha)",
+                combined,
+                level=logging.ERROR,
+            )
+            raise RuntimeError(
+                f"Sanitize SQL falhou (exit={result.returncode}): "
+                f"{self._truncate_for_log(combined, 2048) or '(sem output)'}"
+            )
+        self._log_sanitize_cli_output("Sanitize CLI output", combined)
+        return combined
+
     def _dump_dir_today(self) -> Path:
         dated = datetime.now().strftime("%d%m%Y")
         path = self.dump_base_dir / dated
@@ -515,12 +705,8 @@ class AuroraClone:
             )
             return list(self.dev_schemas)
 
-        if not self.temp_id:
-            raise RuntimeError(
-                "TEMP_IDENTIFIER ausente: necessário para auto-descobrir "
-                "schemas (DEV − TEMP). Rode make clone-prod-to-temp antes "
-                "ou defina DEV_SCHEMAS."
-            )
+        if not self.temp_id or not self._cluster_exists(self.temp_id):
+            raise RuntimeError(TEMP_REQUIRED_UNAVAILABLE)
 
         try:
             dev_host = self._cluster_endpoint(self.dev_id)
@@ -528,10 +714,11 @@ class AuroraClone:
         except ClientError as error:
             code = error.response.get("Error", {}).get("Code", "")
             if code == "DBClusterNotFoundFault":
+                if not self._cluster_exists(self.temp_id):
+                    raise RuntimeError(TEMP_REQUIRED_UNAVAILABLE) from error
                 raise RuntimeError(
-                    "Cluster TEMP (ou DEV) não encontrado. Rode "
-                    "make clone-prod-to-temp antes do dump, ou defina "
-                    "DEV_SCHEMAS."
+                    "Cluster DEV não encontrado. Confira DEV_IDENTIFIER ou "
+                    "defina DEV_SCHEMAS."
                 ) from error
             raise
 
@@ -1088,7 +1275,7 @@ class AuroraClone:
         return result
 
     # ------------------------------------------------------------------
-    # Pipeline steps 1–7
+    # Pipeline steps 1–8
     # ------------------------------------------------------------------
 
     def clone_prod_to_temp(self) -> None:
@@ -1161,8 +1348,88 @@ class AuroraClone:
         self._ensure_temp_db_user(master_username)
         logging.info("Clone PROD→TEMP concluído: %s", self.temp_id)
 
+    def sanitize_temp_data(self) -> None:
+        """
+        2. Sanitize TEMP (pós-clone, pré-dump).
+        Com SANITIZE_SQL_PATH: executa o .sql.
+        Sem path: lista schemas (information_schema; MySQL e PostgreSQL).
+        1 retry após 60s; na 2ª falha apaga TEMP e aborta.
+        """
+        self._resolve_db_credentials()
+        self._require_env("TEMP_IDENTIFIER", "DB_PASSWORD")
+
+        sql_path: Path | None = None
+        sql_statement: str | None = None
+        if self.sanitize_sql_path:
+            sql_path = Path(self.sanitize_sql_path)
+            if not sql_path.is_file():
+                raise RuntimeError(
+                    f"SANITIZE_SQL_PATH não encontrado ou não é arquivo: "
+                    f"{sql_path}"
+                )
+            mode_label = f"file={sql_path}"
+        else:
+            sql_statement = SANITIZE_LIST_SCHEMAS_SQL
+            mode_label = "list-schemas (SANITIZE_SQL_PATH vazio)"
+            logging.info(
+                "SANITIZE_SQL_PATH vazio: listando schemas na TEMP "
+                "(%s).",
+                SANITIZE_LIST_SCHEMAS_SQL,
+            )
+
+        endpoint = self._cluster_endpoint(self.temp_id, role="TEMP")
+        engine, port = self._cluster_engine_and_port(
+            self.temp_id, role="TEMP"
+        )
+        logging.info(
+            "Sanitize TEMP %s (%s:%s engine=%s) %s",
+            self.temp_id,
+            endpoint,
+            port,
+            engine,
+            mode_label,
+        )
+
+        last_error: BaseException | None = None
+        for attempt in (1, 2):
+            try:
+                logging.info("Sanitize tentativa %s/2...", attempt)
+                self._run_sanitize_cli(
+                    host=endpoint,
+                    port=port,
+                    engine=engine,
+                    sql_path=sql_path,
+                    sql_statement=sql_statement,
+                )
+                logging.info(
+                    "Sanitize TEMP concluído (tentativa %s).", attempt
+                )
+                return
+            except Exception as error:
+                last_error = error
+                if attempt == 1:
+                    logging.warning(
+                        "Sanitize falhou (tentativa 1): %s. "
+                        "Aguardando %ss e retentando...",
+                        error,
+                        SANITIZE_RETRY_WAIT_SECONDS,
+                    )
+                    time.sleep(SANITIZE_RETRY_WAIT_SECONDS)
+                    continue
+                logging.error(
+                    "Sanitize falhou (tentativa 2): %s. Apagando TEMP %s.",
+                    error,
+                    self.temp_id,
+                )
+                self._delete_cluster_and_instance(self.temp_id)
+                raise RuntimeError(
+                    f"Sanitize TEMP falhou após retry: {error}"
+                ) from error
+
+        raise RuntimeError(f"Sanitize TEMP falhou: {last_error}")
+
     def dump_dev_schemas(self) -> Path:
-        """2. Dump dos schemas DEV com mydumper."""
+        """3. Dump dos schemas DEV com mydumper."""
         self._resolve_db_credentials()
         self._require_env(
             "PROD_IDENTIFIER",
@@ -1209,7 +1476,7 @@ class AuroraClone:
         return dump_dir
 
     def restore_dump_to_temp(self) -> None:
-        """3. Restore dump DEV → TEMP com myloader (--overwrite-tables)."""
+        """4. Restore dump DEV → TEMP com myloader (--overwrite-tables)."""
         self._resolve_db_credentials()
         self._require_env(
             "PROD_IDENTIFIER",
@@ -1253,7 +1520,7 @@ class AuroraClone:
 
     def validate_dev_vs_temp(self) -> dict:
         """
-        4. Compara COUNT(*) DEV vs TEMP nos schemas dumpados.
+        5. Compara COUNT(*) DEV vs TEMP nos schemas dumpados.
         Em falha: apaga TEMP e aborta (DEV intacto).
         """
         self._resolve_db_credentials()
@@ -1378,7 +1645,7 @@ class AuroraClone:
         return result
 
     def rename_dev_to_old(self) -> None:
-        """5. Renomeia DEV → OLD (cluster + writer)."""
+        """6. Renomeia DEV → OLD (cluster + writer)."""
         self._require_env("DEV_IDENTIFIER", "OLD_IDENTIFIER", "PROD_IDENTIFIER")
         self._assert_not_prod(self.dev_id, "rename_dev_to_old")
         self._assert_not_prod(self.old_id, "rename_dev_to_old")
@@ -1390,7 +1657,7 @@ class AuroraClone:
         logging.info("Rename DEV→OLD concluído: %s", self.old_id)
 
     def rename_temp_to_dev(self) -> None:
-        """6. Renomeia TEMP → DEV (cluster + writer)."""
+        """7. Renomeia TEMP → DEV (cluster + writer)."""
         self._require_env("TEMP_IDENTIFIER", "DEV_IDENTIFIER", "PROD_IDENTIFIER")
         self._assert_not_prod(self.temp_id, "rename_temp_to_dev")
         self._assert_not_prod(self.dev_id, "rename_temp_to_dev")
@@ -1398,7 +1665,7 @@ class AuroraClone:
         logging.info("Rename TEMP→DEV concluído: %s", self.dev_id)
 
     def delete_old_dev(self) -> None:
-        """7. Apaga OLD (ou só loga se KEEP_OLD_DEV_HOURS > 0)."""
+        """8. Apaga OLD (ou só loga se KEEP_OLD_DEV_HOURS > 0)."""
         self._require_env("OLD_IDENTIFIER", "PROD_IDENTIFIER")
         self._assert_not_prod(self.old_id, "delete_old_dev")
         if self.keep_old_dev_hours > 0:
@@ -1414,10 +1681,11 @@ class AuroraClone:
         logging.info("Delete OLD concluído.")
 
     def run_pipeline(self) -> None:
-        """Executa passos 1→7 na ordem."""
+        """Executa passos 1→8 na ordem."""
         logging.info("=== Pipeline Aurora Clone: início ===")
         self._resolve_db_credentials()
         self.clone_prod_to_temp()
+        self.sanitize_temp_data()
         self.dump_dev_schemas()
         self.restore_dump_to_temp()
         self.validate_dev_vs_temp()
@@ -1429,7 +1697,7 @@ class AuroraClone:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Aurora Clone — pipeline PROD→DEV (passos 1–7)"
+        description="Aurora Clone — pipeline PROD→DEV (passos 1–8)"
     )
     sub = parser.add_subparsers(dest="command")
 
@@ -1440,13 +1708,20 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("check-policy", help="Checa policy AvoidDeleteAuroraCloneBoto3")
     sub.add_parser("list-rds", help="Lista clusters RDS e engines")
     sub.add_parser("clone-prod-to-temp", help="1. Clone PROD → TEMP")
-    sub.add_parser("dump-dev", help="2. Dump schemas DEV (mydumper)")
-    sub.add_parser("restore-temp", help="3. Restore dump → TEMP (myloader)")
-    sub.add_parser("validate", help="4. Valida DEV vs TEMP (row counts)")
-    sub.add_parser("rename-dev-to-old", help="5. Rename DEV → OLD")
-    sub.add_parser("rename-temp-to-dev", help="6. Rename TEMP → DEV")
-    sub.add_parser("delete-old-dev", help="7. Delete OLD")
-    sub.add_parser("pipeline", help="Roda passos 1→7")
+    sub.add_parser(
+        "sanitize-temp",
+        help=(
+            "2. Sanitize TEMP (.sql via SANITIZE_SQL_PATH; "
+            "vazio = lista schemas)"
+        ),
+    )
+    sub.add_parser("dump-dev", help="3. Dump schemas DEV (mydumper)")
+    sub.add_parser("restore-temp", help="4. Restore dump → TEMP (myloader)")
+    sub.add_parser("validate", help="5. Valida DEV vs TEMP (row counts)")
+    sub.add_parser("rename-dev-to-old", help="6. Rename DEV → OLD")
+    sub.add_parser("rename-temp-to-dev", help="7. Rename TEMP → DEV")
+    sub.add_parser("delete-old-dev", help="8. Delete OLD")
+    sub.add_parser("pipeline", help="Roda passos 1→8")
     return parser
 
 
@@ -1477,6 +1752,8 @@ def main(argv: list[str] | None = None) -> None:
         )
     elif command == "clone-prod-to-temp":
         app.clone_prod_to_temp()
+    elif command == "sanitize-temp":
+        app.sanitize_temp_data()
     elif command == "dump-dev":
         app.dump_dev_schemas()
     elif command == "restore-temp":

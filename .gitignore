@@ -1,5 +1,6 @@
 __pycache__/
 .env
+.env.local
 .venv/
 dumps/
 .aurora_game_checkpoint

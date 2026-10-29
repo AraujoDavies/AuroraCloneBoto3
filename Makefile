@@ -8,7 +8,7 @@ SCRIPT := aurora_clone.py
 .DEFAULT_GOAL := help
 
 .PHONY: help account-aws check-policy generate-policy list-rds \
-	clone-prod-to-temp dump-dev restore-temp validate \
+	clone-prod-to-temp sanitize-temp dump-dev restore-temp validate \
 	rename-dev-to-old rename-temp-to-dev delete-old-dev \
 	pipeline run game
 
@@ -36,6 +36,9 @@ list-rds:
 
 clone-prod-to-temp:
 	$(PYTHON) $(SCRIPT) clone-prod-to-temp
+
+sanitize-temp:
+	$(PYTHON) $(SCRIPT) sanitize-temp
 
 dump-dev:
 	$(PYTHON) $(SCRIPT) dump-dev

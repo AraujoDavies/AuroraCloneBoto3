@@ -4,7 +4,7 @@ Operação Aurora — campanha narrativa no terminal (MVP).
 Três fases, avanço 100% manual (hub → Enter inicia etapa → volta ao hub).
 
   01 Reconhecimento — pré-voo (tools, AWS, RDS, policy, senha; .env sob demanda)
-  02 Escalada       — clone → dump → restore → validate → renames
+  02 Escalada       — clone → sanitize → dump → restore → validate → renames
   03 Aurora         — delete OLD (+ animação de espera)
 
 Uso (container -it):
@@ -33,7 +33,12 @@ from typing import Callable
 from botocore.exceptions import ClientError
 from dotenv import load_dotenv
 
-from aurora_clone import AuroraClone, mask_account_id, mask_account_in_text
+from aurora_clone import (
+    AuroraClone,
+    TEMP_REQUIRED_UNAVAILABLE,
+    mask_account_id,
+    mask_account_in_text,
+)
 
 CHECKPOINT_PATH = Path(".aurora_game_checkpoint")
 NO_ANIM = False
@@ -325,12 +330,25 @@ def _radar_env_mismatch_error(
     clusters: list[dict],
     missing_labels: list[str],
 ) -> RuntimeError:
-    """Bancos existem na região, mas DEV_IDENTIFIER do .env não bate."""
+    """Bancos existem na região, mas PROD/DEV_IDENTIFIER do .env não batem."""
+    label_to_env = {
+        "PROD": "PROD_IDENTIFIER",
+        "DEV": "DEV_IDENTIFIER",
+    }
+    env_keys = [
+        label_to_env[label]
+        for label in missing_labels
+        if label in label_to_env
+    ]
+    if not env_keys:
+        env_keys = ["PROD_IDENTIFIER", "DEV_IDENTIFIER"]
+    env_hint = " e/ou ".join(env_keys)
     lines = [
         "Os bancos existem na região, mas as variáveis de ambiente "
         "não correspondem.",
         f"Região: {app.region}",
-        f".env atual: DEV_IDENTIFIER={app.dev_id or '(vazio)'}",
+        f".env atual: PROD_IDENTIFIER={app.prod_id or '(vazio)'}  "
+        f"DEV_IDENTIFIER={app.dev_id or '(vazio)'}",
         f"Não encontrados no .env: {', '.join(missing_labels)}",
         "Clusters encontrados na região:",
     ]
@@ -340,7 +358,7 @@ def _radar_env_mismatch_error(
             f"  - {c(str(ident), GREEN, BOLD)}  status={item.get('status')}"
         )
     lines.append(
-        "Edite o .env (DEV_IDENTIFIER) com o valor correspondente "
+        f"Edite o .env ({env_hint}) com o valor correspondente "
         "e use [r] retry."
     )
     return RuntimeError("\n".join(lines))
@@ -351,15 +369,16 @@ def _check_radar(app: AuroraClone | None) -> str | None:
     clusters = app.list_rds()
     if not clusters:
         raise RuntimeError(
-            "Banco não existe. Crie (Terraform — ver README) para "
-            "prosseguir, ou altere a região."
+            "Banco não existe. Suba com Terraform (README.md — "
+            "seção «Criando ambiente de teste com Terraform»).\n"
+            "Ou altere AWS_DEFAULT_REGION no .env."
         )
 
     by_id = {item.get("identifier"): item for item in clusters}
     env_mismatches: list[str] = []
     status_problems: list[str] = []
 
-    for label, cid in (("DEV", app.dev_id),):
+    for label, cid in (("PROD", app.prod_id), ("DEV", app.dev_id)):
         if not cid:
             env_mismatches.append(label)
             continue
@@ -475,10 +494,35 @@ def _run_clone(app: AuroraClone | None) -> str | None:
     return f"TEMP criado: {app.temp_id}"
 
 
+def _run_sanitize(app: AuroraClone | None) -> str | None:
+    assert app is not None
+    _show_targets(app)
+    app._resolve_db_credentials()
+    if not (app.temp_id or "").strip():
+        raise RuntimeError(TEMP_REQUIRED_UNAVAILABLE)
+    temp_status = _cluster_status(app, app.temp_id)
+    if temp_status != "available":
+        raise RuntimeError(TEMP_REQUIRED_UNAVAILABLE)
+    mode = (
+        f"file={app.sanitize_sql_path}"
+        if (app.sanitize_sql_path or "").strip()
+        else "list-schemas (SANITIZE_SQL_PATH vazio)"
+    )
+    write(c(f"  [RUN] sanitize TEMP ({mode})...", YELLOW))
+    app.sanitize_temp_data()
+    write(c("  [ OK ] Sanitize concluído", GREEN))
+    return f"Sanitize TEMP ok ({mode})"
+
+
 def _run_dump(app: AuroraClone | None) -> str | None:
     assert app is not None
     _show_targets(app)
     app._resolve_db_credentials()
+    if not (app.temp_id or "").strip():
+        raise RuntimeError(TEMP_REQUIRED_UNAVAILABLE)
+    temp_status = _cluster_status(app, app.temp_id)
+    if temp_status != "available":
+        raise RuntimeError(TEMP_REQUIRED_UNAVAILABLE)
     write(c("  [RUN] dump schemas DEV...", YELLOW))
     path = app.dump_dev_schemas()
     write(c(f"  [ OK ] Dump em {path}", GREEN))
@@ -583,24 +627,29 @@ STAGES: list[Stage] = [
         id="radar",
         act=ACT_RECON,
         title="Radar",
-        mission="DEV existe e está available na região; TEMP/OLD só avisam.",
+        mission=(
+            "PROD e DEV existem e estão available na região; "
+            "TEMP/OLD só avisam."
+        ),
         hints=[
-            "Se não houver cluster na região: suba com Terraform "
-            "(README) ou altere AWS_DEFAULT_REGION no .env.",
-            "Se os bancos existirem: ajuste DEV_IDENTIFIER no .env "
-            "para o identifier listado.",
+            "Se não houver cluster na região: suba com Terraform (README.md — "
+            "seção «Criando ambiente de teste com Terraform»).",
+            "Ou altere AWS_DEFAULT_REGION no .env.",
+            "Se os bancos existirem: ajuste PROD_IDENTIFIER e "
+            "DEV_IDENTIFIER no .env para os identifiers listados.",
             "Preencha também TEMP_IDENTIFIER; salve e use [r] retry.",
             "Teste: make PYTHON=python list-rds",
         ],
         run=_check_radar,
         needs_app=True,
-        clear_message="Cluster DEV available",
+        clear_message="Clusters PROD e DEV available",
         sample_errors=[
-            "Banco não existe. Crie (Terraform — ver README) para "
-            "prosseguir, ou altere a região.",
+            "Banco não existe. Suba com Terraform (README.md — "
+            "seção «Criando ambiente de teste com Terraform»).\n"
+            "Ou altere AWS_DEFAULT_REGION no .env.",
             "Os bancos existem na região, mas as variáveis de ambiente "
-            "não correspondem. Edite o .env (DEV_IDENTIFIER) com o "
-            "valor correspondente e use [r] retry.",
+            "não correspondem. Edite o .env (PROD_IDENTIFIER e/ou "
+            "DEV_IDENTIFIER) com o valor correspondente e use [r] retry.",
         ],
     ),
     Stage(
@@ -678,6 +727,30 @@ STAGES: list[Stage] = [
         ],
     ),
     Stage(
+        id="sanitize",
+        act=ACT_CLIMB,
+        title="Sanitize",
+        mission=(
+            "Sanitize TEMP (SANITIZE_SQL_PATH) ou lista schemas se path vazio."
+        ),
+        hints=[
+            "Equivalente a: make PYTHON=python sanitize-temp",
+            "SANITIZE_SQL_PATH vazio → SELECT schema_name "
+            "(MySQL e PostgreSQL).",
+            "Se falhar 2x (retry 60s), TEMP é apagado e DEV permanece intacto.",
+        ],
+        run=_run_sanitize,
+        needs_app=True,
+        mutates=True,
+        confirm_label="sanitize-temp",
+        clear_message="Sanitize TEMP concluído",
+        sample_errors=[
+            TEMP_REQUIRED_UNAVAILABLE,
+            "SANITIZE_SQL_PATH não encontrado ou não é arquivo",
+            "Sanitize TEMP falhou após retry",
+        ],
+    ),
+    Stage(
         id="dump",
         act=ACT_CLIMB,
         title="Dump",
@@ -688,7 +761,7 @@ STAGES: list[Stage] = [
         mutates=True,
         confirm_label="dump-dev",
         clear_message="Dump DEV concluído",
-        sample_errors=["TEMP obrigatório para resolver schemas DEV−TEMP"],
+        sample_errors=[TEMP_REQUIRED_UNAVAILABLE],
     ),
     Stage(
         id="restore",
@@ -1307,7 +1380,55 @@ def _format_stage_error(error: BaseException) -> tuple[str, list[str] | None]:
                 "sts:GetCallerIdentity.",
                 None,
             )
-    return str(error), None
+    msg = str(error)
+    if msg == TEMP_REQUIRED_UNAVAILABLE:
+        return (
+            msg,
+            [
+                "Conclua a etapa Clone (PROD → TEMP) antes do Sanitize.",
+                "Confira se o TEMP existe: make PYTHON=python list-rds.",
+                "Verifique TEMP_IDENTIFIER no .env "
+                "(nome do cluster/banco deve bater com a AWS).",
+            ],
+        )
+    if "SANITIZE_SQL_PATH não encontrado ou não é arquivo" in msg:
+        return (
+            msg,
+            [
+                "Ajuste SANITIZE_SQL_PATH no .env para o caminho "
+                "correto do arquivo .sql (ex.: ./sql/sanitize.example.sql).",
+                "Confira se o arquivo existe e o nome está certo.",
+            ],
+        )
+    if "Sanitize TEMP falhou após retry" in msg:
+        return (
+            msg,
+            [
+                "TEMP foi apagado após 2 falhas; DEV permanece intacto.",
+                "Revise o .sql em SANITIZE_SQL_PATH "
+                "(sintaxe, tabelas/schemas, permissões).",
+                "Confira DB_USER/DB_PASSWORD e se o TEMP "
+                "estava acessível.",
+                "Refaça Clone (PROD → TEMP) e rode Sanitize de novo.",
+            ],
+        )
+    if "TEMP já existe" in msg:
+        return (
+            msg,
+            [
+                "Exclusão manual do banco TEMP para prosseguir.",
+                "Esse comportamento não é esperado antes do clone.",
+            ],
+        )
+    if "Timeout aguardando" in msg:
+        return (
+            msg,
+            [
+                "Para mais informações: make PYTHON=python list-rds",
+                "Ou acompanhe o status no console AWS (RDS → clusters/instâncias).",
+            ],
+        )
+    return msg, None
 
 
 def fail_screen(
