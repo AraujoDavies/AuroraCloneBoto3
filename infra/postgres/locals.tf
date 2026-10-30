@@ -2,7 +2,8 @@ locals {
   engine      = "aurora-postgresql"
   engine_key  = "postgres"
   db_port     = 5432
-  create_dev  = var.deploy_mode == "prod_dev"
+  create_prod = contains(["prod", "prod_dev"], var.deploy_mode)
+  create_dev  = contains(["dev", "prod_dev"], var.deploy_mode)
   name_prefix = "vpc-lab-aurora-clone-boto3-${local.engine_key}"
 
   labs_all = {
@@ -12,6 +13,7 @@ locals {
       vpc_cidr            = "10.20.0.0/16"
       public_subnet_cidrs = ["10.20.0.0/24", "10.20.1.0/24"]
       cluster_identifier  = var.prod_cluster_identifier
+      master_password     = var.prod_master_password
     }
     labdev = {
       role                = "labdev"
@@ -19,12 +21,13 @@ locals {
       vpc_cidr            = "10.21.0.0/16"
       public_subnet_cidrs = ["10.21.0.0/24", "10.21.1.0/24"]
       cluster_identifier  = var.dev_cluster_identifier
+      master_password     = var.dev_master_password
     }
   }
 
   labs = {
     for key, lab in local.labs_all : key => lab
-    if key == "labprod" || local.create_dev
+    if (key == "labprod" && local.create_prod) || (key == "labdev" && local.create_dev)
   }
 
   common_tags = {

@@ -5,13 +5,13 @@ variable "aws_region" {
 }
 
 variable "deploy_mode" {
-  description = "prod = only PROD VPC+cluster; prod_dev = PROD + DEV in separate VPCs"
+  description = "prod = only PROD; dev = only DEV; prod_dev = PROD + DEV in separate VPCs"
   type        = string
   default     = "prod"
 
   validation {
-    condition     = contains(["prod", "prod_dev"], var.deploy_mode)
-    error_message = "deploy_mode must be \"prod\" or \"prod_dev\"."
+    condition     = contains(["prod", "dev", "prod_dev"], var.deploy_mode)
+    error_message = "deploy_mode must be \"prod\", \"dev\", or \"prod_dev\"."
   }
 }
 
@@ -22,7 +22,7 @@ variable "prod_cluster_identifier" {
 }
 
 variable "dev_cluster_identifier" {
-  description = "Aurora cluster / writer identifier for DEV (used when deploy_mode=prod_dev)"
+  description = "Aurora cluster / writer identifier for DEV (used when deploy_mode is dev or prod_dev)"
   type        = string
   default     = "dev-aurora-pg"
 }
@@ -33,10 +33,20 @@ variable "master_username" {
   default     = "labadmin"
 }
 
-variable "master_password" {
-  description = "Master password for Aurora clusters (same for PROD and DEV in lab)"
+variable "prod_master_password" {
+  description = "Master password for PROD Aurora (required when deploy_mode is prod or prod_dev)"
   type        = string
   sensitive   = true
+  default     = null
+  nullable    = true
+}
+
+variable "dev_master_password" {
+  description = "Master password for DEV Aurora (required when deploy_mode is dev or prod_dev)"
+  type        = string
+  sensitive   = true
+  default     = null
+  nullable    = true
 }
 
 variable "allowed_cidr" {
