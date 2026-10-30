@@ -19,9 +19,12 @@ from datetime import datetime
 from pathlib import Path
 
 import boto3
+import psycopg2
 import pymysql
 from botocore.exceptions import ClientError
 from dotenv import load_dotenv
+from psycopg2 import sql as pgsql
+from psycopg2.extras import RealDictCursor
 
 # override=True: após trocar a secret key, o arquivo vence variáveis antigas do shell.
 load_dotenv(override=True)
@@ -49,9 +52,14 @@ SANITIZE_LIST_SCHEMAS_SQL = (
     "SELECT schema_name FROM information_schema.schemata "
     "ORDER BY schema_name;"
 )
-SYSTEM_SCHEMAS = frozenset(
+SYSTEM_SCHEMAS_MYSQL = frozenset(
     {"mysql", "information_schema", "performance_schema", "sys"}
 )
+# Alias histórico (MySQL); listagem PG filtra via SQL, não esta lista.
+SYSTEM_SCHEMAS = SYSTEM_SCHEMAS_MYSQL
+DEFAULT_PG_DATABASE = "postgres"
+PG_LIB_ROOT = Path("/usr/lib/postgresql")
+PG_CLIENT_TOOLS = frozenset({"pg_dump", "pg_restore", "psql"})
 
 # Estado compartilhado entre instâncias AuroraClone (ex.: etapas do game).
 _active_run_dump_dir: Path | None = None
@@ -248,6 +256,7 @@ class AuroraClone:
         ).strip()
         self._db_credentials_resolved = False
         self._master_username_cache: dict[str, str] = {}
+        self._engine_port_cache: dict[str, tuple[str, int]] = {}
 
         self.dev_schemas = [
             s.strip()
@@ -338,6 +347,12 @@ class AuroraClone:
     def _mysql_user_for(
         self, identifier: str, *, role: str | None = None
     ) -> str:
+        """MasterUsername do cluster (cache por identifier). Nome histórico; vale MySQL e PG."""
+        return self._master_user_for(identifier, role=role)
+
+    def _master_user_for(
+        self, identifier: str, *, role: str | None = None
+    ) -> str:
         """MasterUsername do cluster (cache por identifier)."""
         cached = self._master_username_cache.get(identifier)
         if cached:
@@ -371,40 +386,53 @@ class AuroraClone:
 
     def verify_dev_login(self) -> dict:
         """
-        Resolve senha e testa login MySQL no writer do DEV (MasterUsername RDS).
-        Retorna host/user (sem senha). Falha com RuntimeError se connect falhar.
+        Resolve senha e testa login no writer do DEV (MasterUsername RDS).
+        MySQL (pymysql) ou PostgreSQL (psycopg2) conforme Engine do cluster.
+        Retorna host/user/engine/port (sem senha).
         """
         self._require_env("DEV_IDENTIFIER")
         self._resolve_db_credentials()
         if not self.db_password:
             raise RuntimeError("DB_PASSWORD ficou vazia após resolve.")
+        if self.prod_id:
+            self._assert_homogeneous_engines(
+                (self.dev_id, "DEV"),
+                (self.prod_id, "PROD"),
+            )
         user = self._mysql_user_for(self.dev_id, role="DEV")
         host = self._cluster_endpoint(self.dev_id, role="DEV")
+        engine, port = self._cluster_engine_and_port(self.dev_id, role="DEV")
         try:
-            with self._mysql_connect(host, user=user) as conn:
+            with self._db_connect(
+                host, port=port, user=user, engine=engine
+            ) as conn:
                 with conn.cursor() as cur:
                     cur.execute("SELECT 1 AS ok")
                     row = cur.fetchone() or {}
-                if row.get("ok") != 1:
+                if row.get("ok") not in (1, True):
                     raise RuntimeError(
                         f"Smoke login DEV {self.dev_id} respondeu sem ok=1."
                     )
-        except pymysql.Error as error:
+        except (pymysql.Error, psycopg2.Error) as error:
             raise RuntimeError(
-                f"Falha ao conectar no DEV ({self.dev_id} @ {host}) "
-                f"como {user!r}: {error}. "
+                f"Falha ao conectar no DEV ({self.dev_id} @ {host}:{port}, "
+                f"engine={engine}) como {user!r}: {error}. "
                 "Confira MasterUsername (make list-rds), DB_PASSWORD e rede/SG."
             ) from error
         logging.info(
-            "Smoke login DEV ok (cluster=%s user=%s host=%s).",
+            "Smoke login DEV ok (cluster=%s user=%s host=%s:%s engine=%s).",
             self.dev_id,
             user,
             host,
+            port,
+            engine,
         )
         return {
             "cluster": self.dev_id,
             "host": host,
             "user": user,
+            "engine": engine,
+            "port": port,
         }
 
     def _assert_not_prod(self, identifier: str, action: str) -> None:
@@ -550,6 +578,9 @@ class AuroraClone:
         self, identifier: str, *, role: str | None = None
     ) -> tuple[str, int]:
         """Engine (lower) e Port do cluster; default de porta por família."""
+        cached = self._engine_port_cache.get(identifier)
+        if cached:
+            return cached
         response = self._describe_db_cluster(identifier, role=role)
         cluster = response["DBClusters"][0]
         engine = (cluster.get("Engine") or "").strip().lower()
@@ -562,7 +593,15 @@ class AuroraClone:
             port = 5432
         else:
             port = 3306
-        return engine, port
+        result = (engine, port)
+        self._engine_port_cache[identifier] = result
+        return result
+
+    def _engine_for(
+        self, identifier: str, *, role: str | None = None
+    ) -> str:
+        engine, _port = self._cluster_engine_and_port(identifier, role=role)
+        return engine
 
     @staticmethod
     def _is_postgres_engine(engine: str) -> bool:
@@ -572,6 +611,64 @@ class AuroraClone:
     def _is_mysql_engine(engine: str) -> bool:
         eng = (engine or "").lower()
         return "mysql" in eng or eng == "aurora"
+
+    @staticmethod
+    def _pg_major_from_engine_version(engine_version: str | None) -> int | None:
+        if not engine_version:
+            return None
+        segment = str(engine_version).split(".", 1)[0].strip()
+        if not segment or not segment.isdigit():
+            return None
+        return int(segment)
+
+    @classmethod
+    def _engine_family(cls, engine: str) -> str:
+        if cls._is_postgres_engine(engine):
+            return "postgres"
+        if cls._is_mysql_engine(engine):
+            return "mysql"
+        raise RuntimeError(
+            f"Engine não suportada: {engine!r} "
+            "(esperado mysql/aurora-mysql ou postgres/aurora-postgresql)."
+        )
+
+    def _assert_homogeneous_engines(
+        self, *items: tuple[str, str]
+    ) -> str:
+        """
+        Garante que os clusters listados (identifier, role) são da mesma família.
+        Retorna a família ('mysql' | 'postgres').
+        """
+        families: dict[str, tuple[str, str]] = {}
+        for identifier, role in items:
+            if not identifier:
+                continue
+            engine = self._engine_for(identifier, role=role)
+            family = self._engine_family(engine)
+            families[identifier] = (family, engine)
+        unique = {fam for fam, _eng in families.values()}
+        if len(unique) > 1:
+            detail = ", ".join(
+                f"{ident}={eng} ({fam})"
+                for ident, (fam, eng) in families.items()
+            )
+            raise RuntimeError(
+                "PROD/DEV/TEMP devem usar a mesma família de engine "
+                f"(mysql ou postgres). Encontrado: {detail}."
+            )
+        if not unique:
+            raise RuntimeError(
+                "Nenhum cluster informado para checagem de engine."
+            )
+        return next(iter(unique))
+
+    @staticmethod
+    def _default_database(engine: str) -> str:
+        if AuroraClone._is_postgres_engine(engine):
+            return (
+                (os.getenv("DB_NAME") or "").strip() or DEFAULT_PG_DATABASE
+            )
+        return ""
 
     @staticmethod
     def _truncate_for_log(
@@ -611,12 +708,14 @@ class AuroraClone:
         env = os.environ.copy()
 
         if self._is_postgres_engine(engine):
-            if not shutil.which("psql"):
-                raise RuntimeError("Cliente psql não encontrado no PATH.")
+            server_major = self._pg_server_major(
+                host, port, self._mysql_user_for(self.temp_id, role="TEMP"), engine
+            )
+            psql_path, client_major = self._resolve_pg_client("psql", server_major)
             env["PGPASSWORD"] = self.db_password
             temp_user = self._mysql_user_for(self.temp_id, role="TEMP")
             cmd = [
-                "psql",
+                psql_path,
                 "-h",
                 host,
                 "-p",
@@ -624,7 +723,7 @@ class AuroraClone:
                 "-U",
                 temp_user,
                 "-d",
-                "postgres",
+                self._default_database(engine),
                 "-v",
                 "ON_ERROR_STOP=1",
                 "-e",
@@ -632,7 +731,9 @@ class AuroraClone:
             if sql_path is not None:
                 cmd.extend(["-f", str(sql_path)])
                 logging.info(
-                    "Sanitize TEMP via psql (%s:%s) file=%s",
+                    "Sanitize TEMP via psql major=%s (%s) (%s:%s) file=%s",
+                    client_major,
+                    psql_path,
                     host,
                     port,
                     sql_path,
@@ -640,7 +741,10 @@ class AuroraClone:
             else:
                 cmd.extend(["-c", sql_statement or ""])
                 logging.info(
-                    "Sanitize TEMP via psql (%s:%s) statement (list schemas)",
+                    "Sanitize TEMP via psql major=%s (%s) (%s:%s) statement "
+                    "(list schemas)",
+                    client_major,
+                    psql_path,
                     host,
                     port,
                 )
@@ -887,14 +991,178 @@ class AuroraClone:
         *,
         user: str,
         password: str | None = None,
+        port: int = 3306,
     ):
         return pymysql.connect(
             host=host,
+            port=port,
             user=user,
             password=password if password is not None else self.db_password,
             connect_timeout=30,
             read_timeout=120,
             cursorclass=pymysql.cursors.DictCursor,
+        )
+
+    def _postgres_connect(
+        self,
+        host: str,
+        *,
+        user: str,
+        password: str | None = None,
+        port: int = 5432,
+        database: str | None = None,
+    ):
+        return psycopg2.connect(
+            host=host,
+            port=port,
+            user=user,
+            password=password if password is not None else self.db_password,
+            dbname=database or DEFAULT_PG_DATABASE,
+            connect_timeout=30,
+            cursor_factory=RealDictCursor,
+        )
+
+    @staticmethod
+    def _installed_pg_client_majors() -> list[int]:
+        if not PG_LIB_ROOT.is_dir():
+            return []
+        majors: list[int] = []
+        for entry in PG_LIB_ROOT.iterdir():
+            if not entry.is_dir():
+                continue
+            try:
+                major = int(entry.name)
+            except ValueError:
+                continue
+            bin_dir = entry / "bin"
+            if bin_dir.is_dir():
+                majors.append(major)
+        return sorted(majors)
+
+    @staticmethod
+    def _select_pg_client_major(installed: list[int], required: int) -> int:
+        candidates = [major for major in installed if major >= required]
+        if not candidates:
+            installed_text = ", ".join(str(m) for m in installed) or "(nenhuma)"
+            raise RuntimeError(
+                f"Cliente PostgreSQL insuficiente para servidor major {required}. "
+                f"Instaladas: {installed_text}."
+            )
+        return min(candidates)
+
+    @staticmethod
+    def _pg_tool_version_major(tool_path: str) -> int | None:
+        try:
+            result = subprocess.run(
+                [tool_path, "--version"],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        except (OSError, subprocess.CalledProcessError):
+            return None
+        match = re.search(r"(\d+)\.", (result.stdout or result.stderr or ""))
+        if not match:
+            return None
+        return int(match.group(1))
+
+    def _resolve_pg_client(
+        self, tool: str, required_major: int
+    ) -> tuple[str, int]:
+        if tool not in PG_CLIENT_TOOLS:
+            raise ValueError(f"Ferramenta PostgreSQL desconhecida: {tool!r}")
+        installed = self._installed_pg_client_majors()
+        if installed:
+            client_major = self._select_pg_client_major(installed, required_major)
+            path = PG_LIB_ROOT / str(client_major) / "bin" / tool
+            if path.is_file():
+                return (str(path), client_major)
+        fallback = shutil.which(tool)
+        if fallback:
+            version_major = self._pg_tool_version_major(fallback)
+            if version_major is not None and version_major >= required_major:
+                return (fallback, version_major)
+        installed_text = ", ".join(str(m) for m in installed) or "(nenhuma)"
+        raise RuntimeError(
+            f"Cliente {tool} não encontrado para major >= {required_major}. "
+            f"Instaladas em {PG_LIB_ROOT}: {installed_text}."
+        )
+
+    def _pg_server_major(
+        self, host: str, port: int, user: str, engine: str
+    ) -> int:
+        conn = self._postgres_connect(
+            host,
+            user=user,
+            port=port,
+            database=self._default_database(engine),
+        )
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SHOW server_version_num")
+                row = cur.fetchone()
+        finally:
+            conn.close()
+        if row is None:
+            raise RuntimeError(
+                f"Não foi possível ler server_version_num em {host}:{port}."
+            )
+        version_num = row.get("server_version_num")
+        if version_num is None and isinstance(row, (list, tuple)):
+            version_num = row[0]
+        if version_num is None:
+            version_num = next(iter(row.values()))
+        return int(version_num) // 10000
+
+    @staticmethod
+    def _read_dump_pg_client_major(dump_dir: Path) -> int | None:
+        marker = dump_dir / ".pg_client_major"
+        if not marker.is_file():
+            return None
+        text = marker.read_text(encoding="utf-8").strip()
+        if not text:
+            return None
+        return int(text)
+
+    def _db_connect(
+        self,
+        host: str,
+        *,
+        port: int,
+        user: str,
+        engine: str,
+        password: str | None = None,
+    ):
+        """Conexão programática MySQL (pymysql) ou PostgreSQL (psycopg2)."""
+        if self._is_postgres_engine(engine):
+            return self._postgres_connect(
+                host,
+                user=user,
+                password=password,
+                port=port,
+                database=self._default_database(engine),
+            )
+        if self._is_mysql_engine(engine):
+            return self._mysql_connect(
+                host, user=user, password=password, port=port
+            )
+        raise RuntimeError(
+            f"Engine não suportada para connect: {engine!r} "
+            "(esperado mysql/aurora-mysql ou postgres/aurora-postgresql)."
+        )
+
+    def _db_connect_for(
+        self,
+        identifier: str,
+        *,
+        user: str,
+        role: str | None = None,
+        password: str | None = None,
+    ):
+        host = self._cluster_endpoint(identifier, role=role)
+        engine, port = self._cluster_engine_and_port(identifier, role=role)
+        return self._db_connect(
+            host, port=port, user=user, engine=engine, password=password
         )
 
     def _reset_temp_master_password(self) -> None:
@@ -920,17 +1188,25 @@ class AuroraClone:
         self._require_env("TEMP_IDENTIFIER", "DB_PASSWORD")
         user = self._mysql_user_for(self.temp_id, role="TEMP")
         endpoint = self._cluster_endpoint(self.temp_id, role="TEMP")
+        engine, port = self._cluster_engine_and_port(
+            self.temp_id, role="TEMP"
+        )
         last_error: BaseException | None = None
         for attempt in range(1, TEMP_MASTER_LOGIN_MAX_ATTEMPTS + 1):
             logging.info(
-                "Smoke login TEMP tentativa %s/%s (master=%s host=%s)...",
+                "Smoke login TEMP tentativa %s/%s "
+                "(master=%s host=%s:%s engine=%s)...",
                 attempt,
                 TEMP_MASTER_LOGIN_MAX_ATTEMPTS,
                 user,
                 endpoint,
+                port,
+                engine,
             )
             try:
-                with self._mysql_connect(endpoint, user=user):
+                with self._db_connect(
+                    endpoint, port=port, user=user, engine=engine
+                ):
                     pass
                 logging.info(
                     "Smoke login TEMP ok (master=%s, tentativa %s).",
@@ -938,7 +1214,7 @@ class AuroraClone:
                     attempt,
                 )
                 return
-            except pymysql.Error as error:
+            except (pymysql.Error, psycopg2.Error) as error:
                 last_error = error
                 if attempt < TEMP_MASTER_LOGIN_MAX_ATTEMPTS:
                     logging.warning(
@@ -952,7 +1228,8 @@ class AuroraClone:
                     time.sleep(TEMP_MASTER_LOGIN_RETRY_WAIT_SECONDS)
                     continue
                 raise RuntimeError(
-                    f"Falha ao conectar no TEMP ({self.temp_id} @ {endpoint}) "
+                    f"Falha ao conectar no TEMP ({self.temp_id} @ "
+                    f"{endpoint}:{port}, engine={engine}) "
                     f"como {user!r} após {TEMP_MASTER_LOGIN_MAX_ATTEMPTS} "
                     f"tentativas: {error}. "
                     "Confira MasterUsername (make list-rds), DB_PASSWORD e rede/SG."
@@ -961,10 +1238,29 @@ class AuroraClone:
             f"Smoke login TEMP falhou: {last_error}"
         )
 
-    def _list_user_schemas(self, host: str, *, user: str) -> list[str]:
-        """Lista schemas de usuário em host (exclui SYSTEM_SCHEMAS)."""
-        with self._mysql_connect(host, user=user) as conn:
+    def _list_user_schemas(
+        self, identifier: str, *, user: str, role: str | None = None
+    ) -> list[str]:
+        """Lista schemas de usuário no cluster (exclui schemas de sistema)."""
+        engine, _port = self._cluster_engine_and_port(identifier, role=role)
+        with self._db_connect_for(
+            identifier, user=user, role=role
+        ) as conn:
             with conn.cursor() as cur:
+                if self._is_postgres_engine(engine):
+                    cur.execute(
+                        """
+                        SELECT schema_name AS schema_name
+                        FROM information_schema.schemata
+                        WHERE schema_name NOT IN (
+                            'information_schema', 'pg_catalog'
+                        )
+                          AND schema_name !~ '^pg_'
+                        ORDER BY schema_name
+                        """
+                    )
+                    names = [row["schema_name"] for row in cur.fetchall()]
+                    return sorted(names)
                 cur.execute(
                     """
                     SELECT SCHEMA_NAME AS schema_name
@@ -973,7 +1269,7 @@ class AuroraClone:
                     """
                 )
                 names = [row["schema_name"] for row in cur.fetchall()]
-        return sorted(s for s in names if s not in SYSTEM_SCHEMAS)
+        return sorted(s for s in names if s not in SYSTEM_SCHEMAS_MYSQL)
 
     def _resolve_dev_only_schemas(self) -> list[str]:
         """
@@ -993,8 +1289,9 @@ class AuroraClone:
             raise RuntimeError(TEMP_REQUIRED_UNAVAILABLE)
 
         try:
-            dev_host = self._cluster_endpoint(self.dev_id)
-            temp_host = self._cluster_endpoint(self.temp_id)
+            # Touch endpoints early for clearer DBClusterNotFoundFault.
+            self._cluster_endpoint(self.dev_id)
+            self._cluster_endpoint(self.temp_id)
         except ClientError as error:
             code = error.response.get("Error", {}).get("Code", "")
             if code == "DBClusterNotFoundFault":
@@ -1007,10 +1304,24 @@ class AuroraClone:
             raise
 
         try:
+            self._assert_homogeneous_engines(
+                (self.dev_id, "DEV"),
+                (self.temp_id, "TEMP"),
+            )
+            if self.prod_id:
+                self._assert_homogeneous_engines(
+                    (self.prod_id, "PROD"),
+                    (self.dev_id, "DEV"),
+                    (self.temp_id, "TEMP"),
+                )
             dev_user = self._mysql_user_for(self.dev_id, role="DEV")
             temp_user = self._mysql_user_for(self.temp_id, role="TEMP")
-            dev_schemas = self._list_user_schemas(dev_host, user=dev_user)
-            temp_schemas = self._list_user_schemas(temp_host, user=temp_user)
+            dev_schemas = self._list_user_schemas(
+                self.dev_id, user=dev_user, role="DEV"
+            )
+            temp_schemas = self._list_user_schemas(
+                self.temp_id, user=temp_user, role="TEMP"
+            )
         except Exception as error:
             raise RuntimeError(
                 "Falha ao listar schemas em DEV/TEMP. Confirme que TEMP "
@@ -1052,6 +1363,19 @@ class AuroraClone:
             for p in dump_dir.iterdir()
             if p.is_dir() and not p.name.startswith(".")
         )
+        engine = self._engine_for(self.dev_id, role="DEV")
+        if self._is_postgres_engine(engine):
+            missing_dump = [
+                s
+                for s in schemas
+                if not (dump_dir / s / f"{s}.dump").is_file()
+            ]
+            if missing_dump:
+                raise RuntimeError(
+                    "Dump PostgreSQL incompleto (falta *.dump) para: "
+                    + ", ".join(missing_dump)
+                    + f" em {dump_dir}."
+                )
         logging.info(
             "Schemas do dump %s (%s): %s",
             dump_dir,
@@ -1066,11 +1390,19 @@ class AuroraClone:
         return schemas
 
     def _table_row_counts(
-        self, host: str, schemas: list[str], *, user: str
+        self,
+        identifier: str,
+        schemas: list[str],
+        *,
+        user: str,
+        role: str | None = None,
     ) -> dict[str, int]:
         """Retorna mapa schema.table → COUNT(*)."""
+        engine, _port = self._cluster_engine_and_port(identifier, role=role)
         counts: dict[str, int] = {}
-        with self._mysql_connect(host, user=user) as conn:
+        with self._db_connect_for(
+            identifier, user=user, role=role
+        ) as conn:
             with conn.cursor() as cur:
                 for schema in schemas:
                     cur.execute(
@@ -1085,9 +1417,20 @@ class AuroraClone:
                     tables = [row["table_name"] for row in cur.fetchall()]
                     for table in tables:
                         key = f"{schema}.{table}"
-                        cur.execute(
-                            f"SELECT COUNT(*) AS cnt FROM `{schema}`.`{table}`"
-                        )
+                        if self._is_postgres_engine(engine):
+                            cur.execute(
+                                pgsql.SQL(
+                                    "SELECT COUNT(*) AS cnt FROM {}.{}"
+                                ).format(
+                                    pgsql.Identifier(schema),
+                                    pgsql.Identifier(table),
+                                )
+                            )
+                        else:
+                            cur.execute(
+                                f"SELECT COUNT(*) AS cnt "
+                                f"FROM `{schema}`.`{table}`"
+                            )
                         counts[key] = int(cur.fetchone()["cnt"])
         return counts
 
@@ -1517,12 +1860,18 @@ class AuroraClone:
                 self._writer_instance_info(cluster)
             )
             master_user = cluster.get("MasterUsername") or "-"
+            engine = cluster.get("Engine")
+            engine_version = cluster.get("EngineVersion")
+            pg_major: int | None = None
+            if self._is_postgres_engine(engine or ""):
+                pg_major = self._pg_major_from_engine_version(engine_version)
             item = {
                 "identifier": cluster.get("DBClusterIdentifier"),
                 "status": cluster.get("Status"),
-                "engine": cluster.get("Engine"),
-                "engine_version": cluster.get("EngineVersion"),
+                "engine": engine,
+                "engine_version": engine_version,
                 "endpoint": cluster.get("Endpoint"),
+                "port": cluster.get("Port"),
                 "region": self.region,
                 "subnet_group": cluster.get("DBSubnetGroup") or "-",
                 "vpc_security_group_ids": sg_ids,
@@ -1531,34 +1880,67 @@ class AuroraClone:
                 "publicly_accessible": publicly_accessible,
                 "master_user": master_user,
             }
+            if pg_major is not None:
+                item["pg_major"] = pg_major
             result.append(item)
-            logging.info(
-                "Cluster %s\n"
-                "  identifier:      %s\n"
-                "  status:          %s\n"
-                "  engine:          %s (%s)\n"
-                "  region:          %s\n"
-                "  subnet:          %s\n"
-                "  sg:              %s\n"
-                "  writer:          %s\n"
-                "  instance_class:  %s\n"
-                "  publico:         %s\n"
-                "  master_user:     %s\n"
-                "  endpoint:        %s",
-                item["identifier"],
-                item["identifier"],
-                item["status"],
-                item["engine"],
-                item["engine_version"],
-                item["region"],
-                item["subnet_group"],
-                ",".join(sg_ids) or "-",
-                writer_id or "-",
-                instance_class or "-",
-                self._publico_label(publicly_accessible),
-                master_user,
-                item["endpoint"],
-            )
+            if pg_major is not None:
+                logging.info(
+                    "Cluster %s\n"
+                    "  identifier:      %s\n"
+                    "  status:          %s\n"
+                    "  engine:          %s (%s)\n"
+                    "  major:           %s\n"
+                    "  region:          %s\n"
+                    "  subnet:          %s\n"
+                    "  sg:              %s\n"
+                    "  writer:          %s\n"
+                    "  instance_class:  %s\n"
+                    "  publico:         %s\n"
+                    "  master_user:     %s\n"
+                    "  endpoint:        %s",
+                    item["identifier"],
+                    item["identifier"],
+                    item["status"],
+                    item["engine"],
+                    item["engine_version"],
+                    pg_major,
+                    item["region"],
+                    item["subnet_group"],
+                    ",".join(sg_ids) or "-",
+                    writer_id or "-",
+                    instance_class or "-",
+                    self._publico_label(publicly_accessible),
+                    master_user,
+                    item["endpoint"],
+                )
+            else:
+                logging.info(
+                    "Cluster %s\n"
+                    "  identifier:      %s\n"
+                    "  status:          %s\n"
+                    "  engine:          %s (%s)\n"
+                    "  region:          %s\n"
+                    "  subnet:          %s\n"
+                    "  sg:              %s\n"
+                    "  writer:          %s\n"
+                    "  instance_class:  %s\n"
+                    "  publico:         %s\n"
+                    "  master_user:     %s\n"
+                    "  endpoint:        %s",
+                    item["identifier"],
+                    item["identifier"],
+                    item["status"],
+                    item["engine"],
+                    item["engine_version"],
+                    item["region"],
+                    item["subnet_group"],
+                    ",".join(sg_ids) or "-",
+                    writer_id or "-",
+                    instance_class or "-",
+                    self._publico_label(publicly_accessible),
+                    master_user,
+                    item["endpoint"],
+                )
 
         return result
 
@@ -1748,7 +2130,7 @@ class AuroraClone:
         raise RuntimeError(f"Sanitize TEMP falhou: {last_error}")
 
     def dump_dev_schemas(self) -> Path:
-        """3. Dump dos schemas DEV com mydumper."""
+        """3. Dump dos schemas DEV (mydumper ou pg_dump -Fc)."""
         self._prune_old_dump_runs()
         self._resolve_db_credentials()
         self._require_env(
@@ -1757,48 +2139,103 @@ class AuroraClone:
             "TEMP_IDENTIFIER",
             "DB_PASSWORD",
         )
+        family = self._assert_homogeneous_engines(
+            (self.prod_id, "PROD"),
+            (self.dev_id, "DEV"),
+            (self.temp_id, "TEMP"),
+        )
         schemas = self._resolve_dev_only_schemas()
         endpoint = self._cluster_endpoint(self.dev_id)
         user = self._mysql_user_for(self.dev_id, role="DEV")
+        engine, port = self._cluster_engine_and_port(self.dev_id, role="DEV")
         dump_dir = self._ensure_run_dump_dir()
+        (dump_dir / ".engine").write_text(engine + "\n", encoding="utf-8")
         logging.info(
-            "Dump DEV %s (%s user=%s) schemas=%s → %s",
+            "Dump DEV %s (%s:%s user=%s engine=%s) schemas=%s → %s",
             self.dev_id,
             endpoint,
+            port,
             user,
+            engine,
             schemas,
             dump_dir,
         )
-        for schema in schemas:
-            schema_dir = dump_dir / schema
-            schema_dir.mkdir(parents=True, exist_ok=True)
-            cmd = [
-                "mydumper",
-                "-h",
-                endpoint,
-                "-u",
-                user,
-                "-p",
-                self.db_password,
-                "-B",
-                schema,
-                "-o",
-                str(schema_dir),
-                "--routines",
-                "--triggers",
-                "--events",
-                "--compress",
-                "--threads",
-                "4",
-                "--no-locks",
-            ]
-            logging.info("mydumper schema=%s → %s", schema, schema_dir)
-            subprocess.run(cmd, check=True)
+        if family == "postgres":
+            server_major = self._pg_server_major(endpoint, port, user, engine)
+            pg_dump_path, client_major = self._resolve_pg_client(
+                "pg_dump", server_major
+            )
+            (dump_dir / ".pg_client_major").write_text(
+                f"{client_major}\n", encoding="utf-8"
+            )
+            dbname = self._default_database(engine)
+            env = os.environ.copy()
+            env["PGPASSWORD"] = self.db_password
+            for schema in schemas:
+                schema_dir = dump_dir / schema
+                schema_dir.mkdir(parents=True, exist_ok=True)
+                out_file = schema_dir / f"{schema}.dump"
+                cmd = [
+                    pg_dump_path,
+                    "-h",
+                    endpoint,
+                    "-p",
+                    str(port),
+                    "-U",
+                    user,
+                    "-d",
+                    dbname,
+                    "-n",
+                    schema,
+                    "-Fc",
+                    "--no-owner",
+                    "--no-privileges",
+                    "-f",
+                    str(out_file),
+                ]
+                logging.info(
+                    "pg_dump major=%s (%s) schema=%s → %s",
+                    client_major,
+                    pg_dump_path,
+                    schema,
+                    out_file,
+                )
+                subprocess.run(cmd, check=True, env=env)
+        else:
+            if not shutil.which("mydumper"):
+                raise RuntimeError("Cliente mydumper não encontrado no PATH.")
+            for schema in schemas:
+                schema_dir = dump_dir / schema
+                schema_dir.mkdir(parents=True, exist_ok=True)
+                cmd = [
+                    "mydumper",
+                    "-h",
+                    endpoint,
+                    "-P",
+                    str(port),
+                    "-u",
+                    user,
+                    "-p",
+                    self.db_password,
+                    "-B",
+                    schema,
+                    "-o",
+                    str(schema_dir),
+                    "--routines",
+                    "--triggers",
+                    "--events",
+                    "--compress",
+                    "--threads",
+                    "4",
+                    "--no-locks",
+                ]
+                logging.info("mydumper schema=%s → %s", schema, schema_dir)
+                subprocess.run(cmd, check=True)
         logging.info("Dump DEV concluído em %s", dump_dir)
         return dump_dir
 
     def restore_dump_to_temp(self) -> None:
-        """4. Restore dump DEV → TEMP com myloader (--overwrite-tables)."""
+        """4. Restore dump DEV → TEMP (myloader ou pg_restore)."""
         self._resolve_db_credentials()
         self._require_env(
             "PROD_IDENTIFIER",
@@ -1806,41 +2243,103 @@ class AuroraClone:
             "TEMP_IDENTIFIER",
             "DB_PASSWORD",
         )
+        family = self._assert_homogeneous_engines(
+            (self.prod_id, "PROD"),
+            (self.dev_id, "DEV"),
+            (self.temp_id, "TEMP"),
+        )
         schemas = self._resolve_dev_only_schemas()
         endpoint = self._cluster_endpoint(self.temp_id)
         user = self._mysql_user_for(self.temp_id, role="TEMP")
+        engine, port = self._cluster_engine_and_port(self.temp_id, role="TEMP")
         dump_dir = self._resolve_run_dump_dir()
         logging.info(
-            "Restore dump %s → TEMP %s (%s user=%s) schemas=%s",
+            "Restore dump %s → TEMP %s (%s:%s user=%s engine=%s) schemas=%s",
             dump_dir,
             self.temp_id,
             endpoint,
+            port,
             user,
+            engine,
             schemas,
         )
-        for schema in schemas:
-            schema_dir = dump_dir / schema
-            if not schema_dir.is_dir():
-                raise RuntimeError(
-                    f"Pasta de dump ausente para schema {schema}: "
-                    f"{schema_dir} (run YYYYMMDD_HHMMSS)"
+        if family == "postgres":
+            temp_major = self._pg_server_major(endpoint, port, user, engine)
+            dump_major = self._read_dump_pg_client_major(dump_dir)
+            required_major = temp_major
+            if dump_major is not None:
+                required_major = max(temp_major, dump_major)
+            pg_restore_path, client_major = self._resolve_pg_client(
+                "pg_restore", required_major
+            )
+            dbname = self._default_database(engine)
+            env = os.environ.copy()
+            env["PGPASSWORD"] = self.db_password
+            for schema in schemas:
+                schema_dir = dump_dir / schema
+                dump_file = schema_dir / f"{schema}.dump"
+                if not dump_file.is_file():
+                    raise RuntimeError(
+                        f"Arquivo de dump PG ausente para schema {schema}: "
+                        f"{dump_file} (run YYYYMMDD_HHMMSS)"
+                    )
+                cmd = [
+                    pg_restore_path,
+                    "-h",
+                    endpoint,
+                    "-p",
+                    str(port),
+                    "-U",
+                    user,
+                    "-d",
+                    dbname,
+                    "--clean",
+                    "--if-exists",
+                    "--no-owner",
+                    "--no-privileges",
+                    "-j",
+                    "4",
+                    str(dump_file),
+                ]
+                logging.info(
+                    "pg_restore major=%s (%s) schema=%s → TEMP "
+                    "(temp=%s dump=%s required=%s)",
+                    client_major,
+                    pg_restore_path,
+                    schema,
+                    temp_major,
+                    dump_major if dump_major is not None else "n/a",
+                    required_major,
                 )
-            cmd = [
-                "myloader",
-                "-h",
-                endpoint,
-                "-u",
-                user,
-                "-p",
-                self.db_password,
-                "-d",
-                str(schema_dir),
-                "--overwrite-tables",
-                "--threads",
-                "4",
-            ]
-            logging.info("myloader schema=%s → TEMP", schema)
-            subprocess.run(cmd, check=True)
+                subprocess.run(cmd, check=True, env=env)
+        else:
+            if not shutil.which("myloader"):
+                raise RuntimeError("Cliente myloader não encontrado no PATH.")
+            for schema in schemas:
+                schema_dir = dump_dir / schema
+                if not schema_dir.is_dir():
+                    raise RuntimeError(
+                        f"Pasta de dump ausente para schema {schema}: "
+                        f"{schema_dir} (run YYYYMMDD_HHMMSS)"
+                    )
+                cmd = [
+                    "myloader",
+                    "-h",
+                    endpoint,
+                    "-P",
+                    str(port),
+                    "-u",
+                    user,
+                    "-p",
+                    self.db_password,
+                    "-d",
+                    str(schema_dir),
+                    "--overwrite-tables",
+                    "--threads",
+                    "4",
+                ]
+                logging.info("myloader schema=%s → TEMP", schema)
+                subprocess.run(cmd, check=True)
         logging.info("Restore dump→TEMP concluído.")
 
     def validate_dev_vs_temp(self) -> dict:
@@ -1854,6 +2353,11 @@ class AuroraClone:
             "DEV_IDENTIFIER",
             "TEMP_IDENTIFIER",
             "DB_PASSWORD",
+        )
+        self._assert_homogeneous_engines(
+            (self.prod_id, "PROD"),
+            (self.dev_id, "DEV"),
+            (self.temp_id, "TEMP"),
         )
         schemas = self._resolve_restored_schemas()
         dev_host = self._cluster_endpoint(self.dev_id)
@@ -1872,10 +2376,10 @@ class AuroraClone:
         )
         try:
             dev_counts = self._table_row_counts(
-                dev_host, schemas, user=dev_user
+                self.dev_id, schemas, user=dev_user, role="DEV"
             )
             temp_counts = self._table_row_counts(
-                temp_host, schemas, user=temp_user
+                self.temp_id, schemas, user=temp_user, role="TEMP"
             )
         except Exception:
             logging.error(
@@ -2020,6 +2524,12 @@ class AuroraClone:
         try:
             logging.info("=== Pipeline Aurora Clone: início ===")
             self._resolve_db_credentials()
+            # TEMP ainda não existe no início; o passo 1 cria o cluster.
+            family = self._assert_homogeneous_engines(
+                (self.prod_id, "PROD"),
+                (self.dev_id, "DEV"),
+            )
+            logging.info("Pipeline engine family=%s", family)
             self.clone_prod_to_temp()
             self.sanitize_temp_data()
             self.dump_dev_schemas()
@@ -2055,8 +2565,14 @@ def build_parser() -> argparse.ArgumentParser:
             "vazio = lista schemas)"
         ),
     )
-    sub.add_parser("dump-dev", help="3. Dump schemas DEV (mydumper)")
-    sub.add_parser("restore-temp", help="4. Restore dump → TEMP (myloader)")
+    sub.add_parser(
+        "dump-dev",
+        help="3. Dump schemas DEV (mydumper ou pg_dump -Fc)",
+    )
+    sub.add_parser(
+        "restore-temp",
+        help="4. Restore dump → TEMP (myloader ou pg_restore)",
+    )
     sub.add_parser("validate", help="5. Valida DEV vs TEMP (row counts)")
     sub.add_parser("rename-dev-to-old", help="6. Rename DEV → OLD")
     sub.add_parser("rename-temp-to-dev", help="7. Rename TEMP → DEV")

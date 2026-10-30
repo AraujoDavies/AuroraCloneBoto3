@@ -314,14 +314,36 @@ def _require_aws_env() -> None:
 # --- Reconhecimento checks (pré-voo) ---
 
 
-def _check_toolbox(_app: AuroraClone | None) -> str | None:
+def _engine_dump_tools(app: AuroraClone | None) -> tuple[str, ...] | None:
+    """Par de dump/restore do Engine do DEV/PROD, se já resolvível via RDS."""
+    if app is None:
+        return None
+    identifier = (app.dev_id or app.prod_id or "").strip()
+    if not identifier:
+        return None
+    role = "DEV" if app.dev_id else "PROD"
+    try:
+        engine = app._engine_for(identifier, role=role)
+    except Exception:
+        return None
+    if app._is_postgres_engine(engine):
+        return ("pg_dump", "pg_restore")
+    if app._is_mysql_engine(engine):
+        return ("mydumper", "myloader")
+    return None
+
+
+def _check_toolbox(app: AuroraClone | None) -> str | None:
+    # Imagem Docker traz MySQL + PG clients; exige ambos no PATH (pré-voo sem AWS).
     required = (
-        "mydumper",
-        "myloader",
         "terraform",
         "make",
         "mysql",
         "psql",
+        "mydumper",
+        "myloader",
+        "pg_dump",
+        "pg_restore",
     )
     missing = [name for name in required if shutil.which(name) is None]
     if missing:
@@ -331,6 +353,22 @@ def _check_toolbox(_app: AuroraClone | None) -> str | None:
     write(c("  [ OK ] Ferramentas no PATH:", GREEN))
     for name in required:
         write(c(f"         {name} → {shutil.which(name)}", DIM))
+    dump_pair = _engine_dump_tools(app)
+    if dump_pair is not None:
+        write(
+            c(
+                f"         dump/restore neste lab: {', '.join(dump_pair)}",
+                DIM,
+            )
+        )
+    else:
+        write(
+            c(
+                "         dump/restore: mydumper/myloader (MySQL) "
+                "ou pg_dump/pg_restore (PostgreSQL) — Engine no Radar/Keys",
+                DIM,
+            )
+        )
     return None
 
 
@@ -455,6 +493,18 @@ def _check_radar(app: AuroraClone | None) -> str | None:
         write(c(f"  [ OK ] {label} {cid}: available", GREEN))
         if item and item.get("endpoint"):
             write(c(f"         endpoint: {item.get('endpoint')}", DIM))
+        if item and item.get("engine"):
+            write(
+                c(
+                    f"         engine:   {item.get('engine')}"
+                    + (
+                        f"  port={item.get('port')}"
+                        if item.get("port") is not None
+                        else ""
+                    ),
+                    DIM,
+                )
+            )
 
     if env_mismatches:
         raise _radar_env_mismatch_error(app, clusters, env_mismatches)
@@ -494,14 +544,20 @@ def _check_keys(app: AuroraClone | None) -> str | None:
             DIM,
         )
     )
+    engine = info.get("engine") or "?"
+    port = info.get("port")
+    port_s = f":{port}" if port is not None else ""
     write(
         c(
-            f"         user={info['user']}  host={info['host']}  "
-            f"cluster={info['cluster']}",
+            f"         user={info['user']}  host={info['host']}{port_s}  "
+            f"engine={engine}  cluster={info['cluster']}",
             DIM,
         )
     )
-    return f"Login DEV ok ({info['user']}@{info['host']}, senha via {fonte})"
+    return (
+        f"Login DEV ok ({info['user']}@{info['host']}{port_s}, "
+        f"engine={engine}, senha via {fonte})"
+    )
 
 
 def _check_pipe(app: AuroraClone | None) -> str | None:
@@ -672,13 +728,24 @@ STAGES: list[Stage] = [
         id="toolbox",
         act=ACT_RECON,
         title="Toolbox",
-        mission="Conferir mydumper, myloader, terraform e make no PATH.",
+        mission=(
+            "Conferir terraform, make, mysql/psql e dump tools "
+            "(mydumper/myloader ou pg_dump/pg_restore) no PATH."
+        ),
         hints=[
             "Siga o comando docker run completo no inicio do arquivo README.md",
+            "MySQL/Aurora MySQL: mydumper + myloader.",
+            "PostgreSQL/Aurora PostgreSQL: pg_dump + pg_restore "
+            "(clientes PGDG 14–18; major escolhida pela versão do servidor).",
+            "Preencha DEV_IDENTIFIER (ou PROD) no .env para o check "
+            "escolher o par de dump/restore certo.",
         ],
         run=_check_toolbox,
         clear_message="Ferramentas disponíveis",
-        sample_errors=["Ferramentas ausentes no PATH: mydumper, myloader"],
+        sample_errors=[
+            "Ferramentas ausentes no PATH: mydumper, myloader",
+            "Ferramentas ausentes no PATH: pg_dump, pg_restore",
+        ],
     ),
     Stage(
         id="whoami",
@@ -754,10 +821,13 @@ STAGES: list[Stage] = [
         id="keys",
         act=ACT_RECON,
         title="Keys",
-        mission="Resolver senha e validar login MySQL no cluster DEV.",
+        mission=(
+            "Resolver senha e validar login MySQL ou PostgreSQL no cluster DEV."
+        ),
         hints=[
             "Preencha DB_PASSWORD no .env, ou DB_PASSWORD_SSM_PARAM.",
             "Login = MasterUsername do cluster DEV (make list-rds).",
+            "Porta segue o Engine do RDS (3306 MySQL / 5432 PostgreSQL).",
             "Se MasterUsername DEV ≠ PROD: dump usa o master do DEV; "
             "após clone/cutover o DEV herda o nome de master da PROD "
             "(senha alinhada com DB_PASSWORD).",
@@ -770,9 +840,9 @@ STAGES: list[Stage] = [
             "Faltam variáveis de ambiente no .env: "
             "DB_PASSWORD|DB_PASSWORD_SSM_PARAM. Edite o .env e use [r] retry "
             "(sem reiniciar o container).",
-            "Falha ao conectar no DEV (dev-aurora @ …) como 'admin': "
-            "(1045, Access denied). Confira MasterUsername (list-rds), "
-            "DB_PASSWORD e rede/SG.",
+            "Falha ao conectar no DEV (dev-aurora-pg @ …:5432, "
+            "engine=aurora-postgresql) como 'labadmin': timed out. "
+            "Confira MasterUsername (list-rds), DB_PASSWORD e rede/SG.",
         ],
     ),
     Stage(
@@ -840,21 +910,38 @@ STAGES: list[Stage] = [
         id="dump",
         act=ACT_CLIMB,
         title="Dump",
-        mission="Dump dos schemas exclusivos de DEV.",
-        hints=["Equivalente a: make PYTHON=python dump-dev"],
+        mission=(
+            "Dump dos schemas exclusivos de DEV "
+            "(mydumper ou pg_dump -Fc)."
+        ),
+        hints=[
+            "Equivalente a: make PYTHON=python dump-dev",
+            "MySQL: pasta DUMP_BASE_DIR/run/<schema>/ (mydumper).",
+            "PostgreSQL: DUMP_BASE_DIR/run/<schema>/<schema>.dump "
+            "(pg_dump -Fc).",
+            "Lab PG: aplique sql/base_dev_para_lab_pg.sql no DEV "
+            "(schemas exclusivos leads/interno).",
+        ],
         run=_run_dump,
         needs_app=True,
         mutates=True,
         confirm_label="dump-dev",
         clear_message="Dump DEV concluído",
-        sample_errors=[TEMP_REQUIRED_UNAVAILABLE],
+        sample_errors=[
+            TEMP_REQUIRED_UNAVAILABLE,
+            "Nenhum schema exclusivo de DEV (DEV − TEMP vazio)",
+        ],
     ),
     Stage(
         id="restore",
         act=ACT_CLIMB,
         title="Restore",
-        mission="Restore do dump no TEMP (myloader).",
-        hints=["Equivalente a: make PYTHON=python restore-temp"],
+        mission="Restore do dump no TEMP (myloader ou pg_restore).",
+        hints=[
+            "Equivalente a: make PYTHON=python restore-temp",
+            "PostgreSQL: pg_restore --clean --if-exists no *.dump.",
+            "MySQL: myloader --overwrite-tables na pasta do schema.",
+        ],
         run=_run_restore,
         needs_app=True,
         mutates=True,
@@ -862,6 +949,7 @@ STAGES: list[Stage] = [
         clear_message="Restore no TEMP concluído",
         sample_errors=[
             "Pasta de run (YYYYMMDD_HHMMSS) não encontrada",
+            "Arquivo de dump PG ausente para schema",
         ],
     ),
     Stage(
@@ -872,6 +960,8 @@ STAGES: list[Stage] = [
         hints=[
             "Equivalente a: make PYTHON=python validate",
             "Se falhar, TEMP é apagado e DEV permanece intacto.",
+            "PostgreSQL: schemas exclusivos de DEV devem existir "
+            "(seed sql/base_dev_para_lab_pg.sql no lab).",
         ],
         run=_run_validate,
         needs_app=True,

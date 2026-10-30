@@ -32,14 +32,12 @@ resource "aws_rds_cluster" "lab" {
   lifecycle {
     precondition {
       condition     = each.value.master_password != null && each.value.master_password != ""
-      error_message = "A non-empty master password is required for ${each.key} (set prod_master_password or dev_master_password for the active deploy_mode)."
+      error_message = "A non-empty master password is required for ${each.key} (set prod_master_password and dev_master_password)."
     }
   }
 }
 
 resource "terraform_data" "distinct_lab_passwords" {
-  count = var.deploy_mode == "prod_dev" ? 1 : 0
-
   lifecycle {
     precondition {
       condition = (
@@ -47,7 +45,7 @@ resource "terraform_data" "distinct_lab_passwords" {
         && var.dev_master_password != null
         && var.prod_master_password != var.dev_master_password
       )
-      error_message = "prod_master_password and dev_master_password must differ when deploy_mode is \"prod_dev\"."
+      error_message = "prod_master_password and dev_master_password must differ."
     }
   }
 }

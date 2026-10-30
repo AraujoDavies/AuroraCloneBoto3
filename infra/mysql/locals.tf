@@ -2,11 +2,9 @@ locals {
   engine      = "aurora-mysql"
   engine_key  = "mysql"
   db_port     = 3306
-  create_prod = contains(["prod", "prod_dev"], var.deploy_mode)
-  create_dev  = contains(["dev", "prod_dev"], var.deploy_mode)
   name_prefix = "vpc-lab-aurora-clone-boto3-${local.engine_key}"
 
-  labs_all = {
+  labs = {
     labprod = {
       role                = "labprod"
       vpc_name            = "${local.name_prefix}-prod"
@@ -25,15 +23,12 @@ locals {
     }
   }
 
-  labs = {
-    for key, lab in local.labs_all : key => lab
-    if (key == "labprod" && local.create_prod) || (key == "labdev" && local.create_dev)
-  }
-
   common_tags = {
     Project     = "aurora-clone-boto3"
     Environment = "lab"
     Engine      = local.engine_key
     ManagedBy   = "terraform"
   }
+
+  cleanup_extra_clusters_command = "python3 ${path.module}/../scripts/delete_extra_clusters.py --region ${var.aws_region} --prod ${var.prod_cluster_identifier} --dev ${var.dev_cluster_identifier} --temp ${var.temp_cluster_identifier} --old ${var.old_cluster_identifier}"
 }

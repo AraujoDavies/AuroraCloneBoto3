@@ -4,17 +4,6 @@ variable "aws_region" {
   default     = "us-east-1"
 }
 
-variable "deploy_mode" {
-  description = "prod = only PROD; dev = only DEV; prod_dev = PROD + DEV in separate VPCs"
-  type        = string
-  default     = "prod"
-
-  validation {
-    condition     = contains(["prod", "dev", "prod_dev"], var.deploy_mode)
-    error_message = "deploy_mode must be \"prod\", \"dev\", or \"prod_dev\"."
-  }
-}
-
 variable "prod_cluster_identifier" {
   description = "Aurora cluster / writer identifier for PROD"
   type        = string
@@ -22,9 +11,21 @@ variable "prod_cluster_identifier" {
 }
 
 variable "dev_cluster_identifier" {
-  description = "Aurora cluster / writer identifier for DEV (used when deploy_mode is dev or prod_dev)"
+  description = "Aurora cluster / writer identifier for DEV"
   type        = string
   default     = "dev-aurora-pg"
+}
+
+variable "temp_cluster_identifier" {
+  description = "Clone TEMP cluster name (destroy hook; align with TEMP_IDENTIFIER in .env)"
+  type        = string
+  default     = "temp-aurora-pg"
+}
+
+variable "old_cluster_identifier" {
+  description = "Post-rename OLD cluster name (destroy hook; align with OLD_IDENTIFIER in .env)"
+  type        = string
+  default     = "olddev-aurora-pg"
 }
 
 variable "master_username" {
@@ -34,7 +35,7 @@ variable "master_username" {
 }
 
 variable "prod_master_password" {
-  description = "Master password for PROD Aurora (required when deploy_mode is prod or prod_dev)"
+  description = "Master password for PROD Aurora (required; must differ from dev_master_password)"
   type        = string
   sensitive   = true
   default     = null
@@ -42,7 +43,7 @@ variable "prod_master_password" {
 }
 
 variable "dev_master_password" {
-  description = "Master password for DEV Aurora (required when deploy_mode is dev or prod_dev)"
+  description = "Master password for DEV Aurora (required; must differ from prod_master_password)"
   type        = string
   sensitive   = true
   default     = null
