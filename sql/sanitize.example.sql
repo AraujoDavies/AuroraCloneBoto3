@@ -3,8 +3,8 @@
 -- MySQL / Aurora MySQL: rode como está (ou via SANITIZE_SQL_PATH).
 -- Aurora PostgreSQL: adapte sintaxe (aspas, schemas) e use o mesmo path.
 
--- UPDATE laboratorioClone.usuarios
--- SET
---   email = CONCAT('user+', id, '@example.invalid'),
---   senha_hash = REPEAT('0', 64)
--- WHERE id > 0;
+UPDATE labAPPemPROD.usuarios
+SET
+   email = CONCAT('user+', id, '@example.invalid'),
+   senha_hash = REPEAT('0', 64)
+WHERE id > 0;

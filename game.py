@@ -5,7 +5,7 @@ Três fases, avanço 100% manual (hub → Enter inicia etapa → volta ao hub).
 
   01 Reconhecimento — pré-voo (tools, AWS, RDS, policy, senha; .env sob demanda)
   02 Escalada       — clone → sanitize → dump → restore → validate → renames
-  03 Aurora         — delete OLD (+ animação de espera)
+  03 Aurora         — delete OLD (+ animação) → archive S3
 
 Uso (container -it):
   make PYTHON=python game
@@ -36,8 +36,14 @@ from dotenv import load_dotenv
 from aurora_clone import (
     AuroraClone,
     TEMP_REQUIRED_UNAVAILABLE,
+    _RUN_DIR_NAME_RE,
+    create_new_run_dump_dir,
+    dump_base_dir_from_env,
+    latest_run_dump_dir,
     mask_account_id,
     mask_account_in_text,
+    pin_active_run_dump_dir,
+    start_run_file_log,
 )
 
 CHECKPOINT_PATH = Path(".aurora_game_checkpoint")
@@ -115,12 +121,18 @@ def _hack_enabled() -> bool:
 
 
 def load_checkpoint() -> dict:
+    empty = {
+        "phase_id": None,
+        "cleared": [],
+        "updated_at": None,
+        "run_dump_dir": None,
+    }
     if not CHECKPOINT_PATH.is_file():
-        return {"phase_id": None, "cleared": [], "updated_at": None}
+        return empty
     try:
         data = json.loads(CHECKPOINT_PATH.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return {"phase_id": None, "cleared": [], "updated_at": None}
+        return empty
     cleared = data.get("cleared") or []
     if not isinstance(cleared, list):
         cleared = []
@@ -130,18 +142,36 @@ def load_checkpoint() -> dict:
     phase_id = data.get("phase_id")
     if phase_id in _OBSOLETE_STAGE_IDS:
         phase_id = cleared_ids[-1] if cleared_ids else None
+    run_dump_dir = data.get("run_dump_dir")
+    if run_dump_dir is not None:
+        run_dump_dir = str(run_dump_dir).strip() or None
+        if run_dump_dir and not _RUN_DIR_NAME_RE.match(run_dump_dir):
+            run_dump_dir = None
     return {
         "phase_id": phase_id,
         "cleared": cleared_ids,
         "updated_at": data.get("updated_at"),
+        "run_dump_dir": run_dump_dir,
     }
 
 
-def save_checkpoint(phase_id: str, cleared: list[str]) -> None:
+def save_checkpoint(
+    phase_id: str | None,
+    cleared: list[str],
+    run_dump_dir: str | None = None,
+) -> None:
+    """Persiste progresso. Sem run_dump_dir=, preserva o valor já no checkpoint."""
+    existing = load_checkpoint()
+    resolved_run = (
+        run_dump_dir
+        if run_dump_dir is not None
+        else existing.get("run_dump_dir")
+    )
     payload = {
         "phase_id": phase_id,
         "cleared": cleared,
         "updated_at": datetime.now(timezone.utc).isoformat(),
+        "run_dump_dir": resolved_run,
     }
     CHECKPOINT_PATH.write_text(
         json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
@@ -155,6 +185,29 @@ def reset_checkpoint() -> None:
         CHECKPOINT_PATH.unlink(missing_ok=True)
     except OSError as error:
         raise RuntimeError(f"Não foi possível apagar o checkpoint: {error}") from error
+
+
+def ensure_game_run_dump_dir(checkpoint: dict) -> tuple[Path, str]:
+    """
+    Fixa uma pasta de run por campanha (pipeline.log + dumps).
+
+    Retorna (path, nome YYYYMMDD_HHMMSS) para gravar no checkpoint.
+    """
+    base = dump_base_dir_from_env()
+    name = checkpoint.get("run_dump_dir")
+    if isinstance(name, str) and _RUN_DIR_NAME_RE.match(name):
+        path = base / name
+        if path.is_dir():
+            pin_active_run_dump_dir(path)
+            return path, name
+    cleared = checkpoint.get("cleared") or []
+    if cleared:
+        latest = latest_run_dump_dir(base)
+        if latest is not None:
+            pin_active_run_dump_dir(latest)
+            return latest, latest.name
+    path = create_new_run_dump_dir(base)
+    return path, path.name
 
 
 # ---------------------------------------------------------------------------
@@ -262,7 +315,14 @@ def _require_aws_env() -> None:
 
 
 def _check_toolbox(_app: AuroraClone | None) -> str | None:
-    required = ("mydumper", "myloader", "terraform", "make")
+    required = (
+        "mydumper",
+        "myloader",
+        "terraform",
+        "make",
+        "mysql",
+        "psql",
+    )
     missing = [name for name in required if shutil.which(name) is None]
     if missing:
         raise RuntimeError(
@@ -509,7 +569,7 @@ def _run_sanitize(app: AuroraClone | None) -> str | None:
         else "list-schemas (SANITIZE_SQL_PATH vazio)"
     )
     write(c(f"  [RUN] sanitize TEMP ({mode})...", YELLOW))
-    app.sanitize_temp_data()
+    app.sanitize_temp_data(max_attempts=1, preserve_temp_on_failure=True)
     write(c("  [ OK ] Sanitize concluído", GREEN))
     return f"Sanitize TEMP ok ({mode})"
 
@@ -587,6 +647,24 @@ def _run_delete_old(app: AuroraClone | None) -> str | None:
         return f"OLD preservado (KEEP_OLD_DEV_HOURS={keep})"
     write(c("  [ OK ] OLD removido", GREEN))
     return f"OLD removido: {app.old_id}"
+
+
+def _run_archive_s3(app: AuroraClone | None) -> str | None:
+    assert app is not None
+    write(c("  [RUN] archive S3 (log → dumps)...", YELLOW))
+    app.stop_run_file_log()
+    result = app.archive_run_to_s3()
+    app.release_run_dump_dir()
+    if result.get("skipped"):
+        write(c("  [ OK ] S3_BUCKET vazio — archive pulado", YELLOW))
+        return "S3_BUCKET vazio — archive pulado"
+    if not result.get("ok"):
+        err = result.get("error") or "erro desconhecido"
+        write(c(f"  [WARN] Archive S3 falhou (seguindo): {err}", YELLOW))
+        return f"Archive S3 com warning: {err}"
+    uri = result.get("uri") or ""
+    write(c(f"  [ OK ] Archive em {uri}", GREEN))
+    return f"Archive S3: {uri}"
 
 
 STAGES: list[Stage] = [
@@ -679,7 +757,10 @@ STAGES: list[Stage] = [
         mission="Resolver senha e validar login MySQL no cluster DEV.",
         hints=[
             "Preencha DB_PASSWORD no .env, ou DB_PASSWORD_SSM_PARAM.",
-            "Se MasterUsername DEV ≠ PROD, defina DB_USER no .env.",
+            "Login = MasterUsername do cluster DEV (make list-rds).",
+            "Se MasterUsername DEV ≠ PROD: dump usa o master do DEV; "
+            "após clone/cutover o DEV herda o nome de master da PROD "
+            "(senha alinhada com DB_PASSWORD).",
             "Timeout/rede: confira SG e se o DEV é alcançável do container.",
             "Salve e use [r] retry — sem reiniciar o container.",
         ],
@@ -690,7 +771,8 @@ STAGES: list[Stage] = [
             "DB_PASSWORD|DB_PASSWORD_SSM_PARAM. Edite o .env e use [r] retry "
             "(sem reiniciar o container).",
             "Falha ao conectar no DEV (dev-aurora @ …) como 'admin': "
-            "(1045, Access denied). Confira DB_USER/DB_PASSWORD e rede/SG.",
+            "(1045, Access denied). Confira MasterUsername (list-rds), "
+            "DB_PASSWORD e rede/SG.",
         ],
     ),
     Stage(
@@ -712,6 +794,7 @@ STAGES: list[Stage] = [
             "Equivalente a: make PYTHON=python clone-prod-to-temp",
             "Confira PROD_IDENTIFIER no .env (cluster fonte do clone).",
             "Pode demorar até o cluster/instância ficarem available.",
+            "Smoke login TEMP retenta até 5× (30s) após reset de senha.",
         ],
         run=_run_clone,
         needs_app=True,
@@ -724,6 +807,7 @@ STAGES: list[Stage] = [
             "não foi encontrado! Confira PROD_IDENTIFIER no .env "
             "e se o cluster existe na região.",
             "Timeout aguardando available",
+            "Falha ao conectar no TEMP (...) após 5 tentativas",
         ],
     ),
     Stage(
@@ -737,7 +821,9 @@ STAGES: list[Stage] = [
             "Equivalente a: make PYTHON=python sanitize-temp",
             "SANITIZE_SQL_PATH vazio → SELECT schema_name "
             "(MySQL e PostgreSQL).",
-            "Se falhar 2x (retry 60s), TEMP é apagado e DEV permanece intacto.",
+            "No game: 1 tentativa; se falhar, TEMP permanece para "
+            "inspecionar o .sql e a saída do cliente — corrija e [r] retry "
+            "(sem refazer Clone).",
         ],
         run=_run_sanitize,
         needs_app=True,
@@ -747,7 +833,7 @@ STAGES: list[Stage] = [
         sample_errors=[
             TEMP_REQUIRED_UNAVAILABLE,
             "SANITIZE_SQL_PATH não encontrado ou não é arquivo",
-            "Sanitize TEMP falhou após retry",
+            "Sanitize TEMP falhou",
         ],
     ),
     Stage(
@@ -774,7 +860,9 @@ STAGES: list[Stage] = [
         mutates=True,
         confirm_label="restore-temp",
         clear_message="Restore no TEMP concluído",
-        sample_errors=["Pasta de dump do dia não encontrada"],
+        sample_errors=[
+            "Pasta de run (YYYYMMDD_HHMMSS) não encontrada",
+        ],
     ),
     Stage(
         id="validate",
@@ -832,6 +920,29 @@ STAGES: list[Stage] = [
         confirm_label="delete-old-dev",
         clear_message="Vestígios tratados",
         sample_errors=["OLD não encontrado", "AccessDenied em delete"],
+    ),
+    Stage(
+        id="archive_s3",
+        act=ACT_AURORA,
+        title="ArchiveS3",
+        mission=(
+            "Arquivar pipeline.log + dumps DEV no S3 se S3_BUCKET estiver setada."
+        ),
+        hints=[
+            "S3_BUCKET vazio → etapa conclui sem upload.",
+            "Sobe log primeiro, depois arquivos SQL/mydumper.",
+            "S3_DUMP_PREFIX opcional; Lifecycle ~30 dias no bucket recomendado.",
+            "Retenção local: DUMP_LOCAL_RETENTION_DAYS (default 15).",
+        ],
+        run=_run_archive_s3,
+        needs_app=True,
+        mutates=True,
+        confirm_label="archive-s3",
+        clear_message="Archive S3 concluído (ou pulado)",
+        sample_errors=[
+            "AccessDenied em s3:PutObject (warning — etapa segue)",
+            "NoSuchBucket (warning — etapa segue)",
+        ],
     ),
 ]
 
@@ -1400,16 +1511,16 @@ def _format_stage_error(error: BaseException) -> tuple[str, list[str] | None]:
                 "Confira se o arquivo existe e o nome está certo.",
             ],
         )
-    if "Sanitize TEMP falhou após retry" in msg:
+    if "Sanitize TEMP falhou" in msg:
         return (
             msg,
             [
-                "TEMP foi apagado após 2 falhas; DEV permanece intacto.",
+                "No game o TEMP foi preservado — não precisa refazer Clone.",
                 "Revise o .sql em SANITIZE_SQL_PATH "
-                "(sintaxe, tabelas/schemas, permissões).",
-                "Confira DB_USER/DB_PASSWORD e se o TEMP "
+                "(sintaxe, tabelas/schemas, permissões) e a saída do cliente.",
+                "Confira MasterUsername (list-rds), DB_PASSWORD e se o TEMP "
                 "estava acessível.",
-                "Refaça Clone (PROD → TEMP) e rode Sanitize de novo.",
+                "Corrija o .sql / SANITIZE_SQL_PATH e use [r] retry.",
             ],
         )
     if "TEMP já existe" in msg:
@@ -1547,16 +1658,34 @@ def confirm_mutation(stage: Stage, app: AuroraClone) -> bool:
 
 
 def _quiet_logging() -> None:
-    logging.getLogger().setLevel(logging.WARNING)
+    """Console em WARNING; FileHandler (pipeline.log) continua em INFO."""
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    for handler in root.handlers:
+        if isinstance(handler, logging.FileHandler):
+            handler.setLevel(logging.INFO)
+        else:
+            handler.setLevel(logging.WARNING)
 
 
 def _ops_logging() -> None:
-    """Durante mutações, mostrar INFO do AuroraClone."""
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s",
-        force=True,
-    )
+    """Durante mutações, mostrar INFO do AuroraClone no console (+ arquivo)."""
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+    has_stream = False
+    for handler in root.handlers:
+        if isinstance(handler, logging.FileHandler):
+            handler.setLevel(logging.INFO)
+            continue
+        has_stream = True
+        handler.setLevel(logging.INFO)
+        handler.setFormatter(fmt)
+    if not has_stream:
+        stream = logging.StreamHandler()
+        stream.setLevel(logging.INFO)
+        stream.setFormatter(fmt)
+        root.addHandler(stream)
 
 
 def _mark_cleared(cleared: list[str], stage_id: str) -> list[str]:
@@ -1824,10 +1953,21 @@ def title_menu(cleared: list[str], hack_on: bool) -> tuple[str, list[str]]:
 
 def run_game(start_id: str | None = None) -> int:
     require_tty()
+    cp = load_checkpoint()
+    # Uma pasta de run por campanha (evita dumps/YYYYMMDD_HHMMSS extras a cada abertura).
+    _, run_name = ensure_game_run_dump_dir(cp)
+    if cp.get("run_dump_dir") != run_name:
+        save_checkpoint(
+            cp.get("phase_id"),
+            list(cp.get("cleared") or []),
+            run_dump_dir=run_name,
+        )
+        cp["run_dump_dir"] = run_name
+    # pipeline.log desde o início (só logging; UI write() não entra).
+    start_run_file_log()
     _quiet_logging()
     hack_on = _hack_enabled()
 
-    cp = load_checkpoint()
     cleared: list[str] = list(cp.get("cleared") or [])
 
     prefer: str | None = None

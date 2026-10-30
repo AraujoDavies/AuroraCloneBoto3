@@ -70,6 +70,8 @@ def build_policy(
     dev_id: str,
     old_id: str,
     ssm_param: str,
+    s3_bucket: str = "",
+    s3_prefix: str = "",
 ) -> dict:
     statements: list[dict] = [
         {
@@ -141,6 +143,37 @@ def build_policy(
             }
         )
 
+    if s3_bucket:
+        prefix = (s3_prefix or "").strip().strip("/")
+        object_arn = (
+            f"arn:aws:s3:::{s3_bucket}/{prefix}/*"
+            if prefix
+            else f"arn:aws:s3:::{s3_bucket}/*"
+        )
+        statements.append(
+            {
+                "Sid": "PutDumpArchiveToS3",
+                "Effect": "Allow",
+                "Action": [
+                    "s3:PutObject",
+                    "s3:AbortMultipartUpload",
+                    "s3:ListMultipartUploadParts",
+                ],
+                "Resource": [object_arn],
+            }
+        )
+        list_statement: dict = {
+            "Sid": "ListDumpArchiveBucket",
+            "Effect": "Allow",
+            "Action": ["s3:ListBucket"],
+            "Resource": [f"arn:aws:s3:::{s3_bucket}"],
+        }
+        if prefix:
+            list_statement["Condition"] = {
+                "StringLike": {"s3:prefix": [f"{prefix}/*", prefix]}
+            }
+        statements.append(list_statement)
+
     return {"Version": "2012-10-17", "Statement": statements}
 
 
@@ -151,6 +184,8 @@ def main() -> None:
     dev_id = _env("DEV_IDENTIFIER")
     old_id = _env("OLD_IDENTIFIER")
     ssm_param = _env("DB_PASSWORD_SSM_PARAM")
+    s3_bucket = _env("S3_BUCKET")
+    s3_prefix = _env("S3_DUMP_PREFIX")
 
     _require_env(
         {
@@ -171,6 +206,8 @@ def main() -> None:
         dev_id=dev_id,
         old_id=old_id,
         ssm_param=ssm_param,
+        s3_bucket=s3_bucket,
+        s3_prefix=s3_prefix,
     )
     payload = json.dumps(policy, indent=2) + "\n"
     OUTPUT_PATH.write_text(payload, encoding="utf-8")

@@ -8,6 +8,8 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         make \
         mydumper \
+        default-mysql-client \
+        postgresql-client \
         curl \
         ca-certificates \
         unzip \

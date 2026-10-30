@@ -39,7 +39,11 @@ logging.basicConfig(
 AVOID_DELETE_POLICY_NAME = "AvoidDeleteAuroraCloneBoto3"
 POLL_INTERVAL_SECONDS = 30
 SANITIZE_RETRY_WAIT_SECONDS = 60
+TEMP_MASTER_LOGIN_MAX_ATTEMPTS = 5
+TEMP_MASTER_LOGIN_RETRY_WAIT_SECONDS = 30
 SANITIZE_LOG_OUTPUT_MAX_BYTES = 32 * 1024
+PIPELINE_LOG_NAME = "pipeline.log"
+_RUN_DIR_NAME_RE = re.compile(r"^\d{8}_\d{6}$")
 # Válido em MySQL e PostgreSQL quando SANITIZE_SQL_PATH está vazio.
 SANITIZE_LIST_SCHEMAS_SQL = (
     "SELECT schema_name FROM information_schema.schemata "
@@ -48,6 +52,118 @@ SANITIZE_LIST_SCHEMAS_SQL = (
 SYSTEM_SCHEMAS = frozenset(
     {"mysql", "information_schema", "performance_schema", "sys"}
 )
+
+# Estado compartilhado entre instâncias AuroraClone (ex.: etapas do game).
+_active_run_dump_dir: Path | None = None
+_active_file_handler: logging.FileHandler | None = None
+
+
+def dump_base_dir_from_env() -> Path:
+    return Path((os.getenv("DUMP_BASE_DIR") or "./dumps").strip())
+
+
+def pin_active_run_dump_dir(path: Path) -> Path:
+    """Fixa a pasta de run compartilhada (game: reabrir sem criar outro timestamp)."""
+    global _active_run_dump_dir
+    base = dump_base_dir_from_env()
+    path = Path(path)
+    if not _RUN_DIR_NAME_RE.match(path.name):
+        raise ValueError(
+            f"Nome de pasta de run inválido: {path.name!r} "
+            "(esperado YYYYMMDD_HHMMSS)"
+        )
+    target = base / path.name
+    if path != target:
+        try:
+            if path.resolve() != target.resolve():
+                raise ValueError(
+                    f"Pasta de run {path} não está sob DUMP_BASE_DIR ({base})"
+                )
+        except OSError as err:
+            if path.parent != base:
+                raise ValueError(
+                    f"Pasta de run {path} não está sob DUMP_BASE_DIR ({base})"
+                ) from err
+    target.mkdir(parents=True, exist_ok=True)
+    _active_run_dump_dir = target
+    return target
+
+
+def create_new_run_dump_dir(dump_base_dir: Path | None = None) -> Path:
+    """Cria uma nova pasta YYYYMMDD_HHMMSS sob DUMP_BASE_DIR e a fixa como ativa."""
+    global _active_run_dump_dir
+    base = dump_base_dir if dump_base_dir is not None else dump_base_dir_from_env()
+    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = base / run_id
+    path.mkdir(parents=True, exist_ok=True)
+    _active_run_dump_dir = path
+    return path
+
+
+def ensure_run_dump_dir(dump_base_dir: Path | None = None) -> Path:
+    """Cria ou reutiliza a pasta de run YYYYMMDD_HHMMSS sob DUMP_BASE_DIR."""
+    global _active_run_dump_dir
+    if _active_run_dump_dir is not None:
+        _active_run_dump_dir.mkdir(parents=True, exist_ok=True)
+        return _active_run_dump_dir
+    return create_new_run_dump_dir(dump_base_dir)
+
+
+def start_run_file_log(dump_base_dir: Path | None = None) -> Path:
+    """Anexa FileHandler em {run_dir}/pipeline.log (idempotente)."""
+    global _active_file_handler
+    run_dir = ensure_run_dump_dir(dump_base_dir)
+    if _active_file_handler is not None:
+        return run_dir
+    log_path = run_dir / PIPELINE_LOG_NAME
+    handler = logging.FileHandler(log_path, encoding="utf-8")
+    handler.setLevel(logging.INFO)
+    handler.setFormatter(
+        logging.Formatter("%(asctime)s - %(levelname)s: %(message)s")
+    )
+    root = logging.getLogger()
+    if root.level == logging.NOTSET or root.level > logging.INFO:
+        root.setLevel(logging.INFO)
+    root.addHandler(handler)
+    _active_file_handler = handler
+    logging.info("Log de arquivo: %s", log_path)
+    return run_dir
+
+
+def stop_run_file_log() -> None:
+    """Flush/close do FileHandler ativo, se houver."""
+    global _active_file_handler
+    handler = _active_file_handler
+    if handler is None:
+        return
+    root = logging.getLogger()
+    root.removeHandler(handler)
+    try:
+        handler.flush()
+        handler.close()
+    except Exception:
+        pass
+    _active_file_handler = None
+
+
+def clear_active_run_dump_dir() -> None:
+    """Libera a pasta de run compartilhada (próximo dump/pipeline cria outra)."""
+    global _active_run_dump_dir
+    _active_run_dump_dir = None
+
+
+def latest_run_dump_dir(dump_base_dir: Path | None = None) -> Path | None:
+    base = dump_base_dir if dump_base_dir is not None else dump_base_dir_from_env()
+    if not base.is_dir():
+        return None
+    candidates = [
+        p
+        for p in base.iterdir()
+        if p.is_dir() and _RUN_DIR_NAME_RE.match(p.name)
+    ]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda p: p.name)
 
 
 def mask_account_id(account: str | None) -> str:
@@ -126,20 +242,25 @@ class AuroraClone:
         # Opcional: se vazio, clone herda do writer DEV (fallback db.serverless).
         self.db_instance_class = (os.getenv("DB_INSTANCE_CLASS") or "").strip()
 
-        self.db_user = (os.getenv("DB_USER") or "").strip()
         self.db_password = os.getenv("DB_PASSWORD") or ""
         self.db_password_ssm_param = (
             os.getenv("DB_PASSWORD_SSM_PARAM") or ""
         ).strip()
         self._db_credentials_resolved = False
+        self._master_username_cache: dict[str, str] = {}
 
         self.dev_schemas = [
             s.strip()
             for s in (os.getenv("DEV_SCHEMAS") or "").split(",")
             if s.strip()
         ]
-        self.dump_base_dir = Path(
-            (os.getenv("DUMP_BASE_DIR") or "./dumps").strip()
+        self.dump_base_dir = dump_base_dir_from_env()
+        self.s3_bucket = (os.getenv("S3_BUCKET") or "").strip()
+        self.s3_dump_prefix = (
+            (os.getenv("S3_DUMP_PREFIX") or "").strip().strip("/")
+        )
+        self.dump_local_retention_days = int(
+            os.getenv("DUMP_LOCAL_RETENTION_DAYS") or "15"
         )
         self.sanitize_sql_path = (
             os.getenv("SANITIZE_SQL_PATH") or ""
@@ -149,6 +270,8 @@ class AuroraClone:
             os.getenv("WAIT_TIMEOUT_SECONDS") or "3600"
         )
         self.keep_old_dev_hours = float(os.getenv("KEEP_OLD_DEV_HOURS") or "0")
+        self._run_dump_dir: Path | None = _active_run_dump_dir
+        self._s3 = None
 
     # ------------------------------------------------------------------
     # Config / guards / wait helpers
@@ -163,7 +286,6 @@ class AuroraClone:
             "OLD_IDENTIFIER": self.old_id,
             "DB_SUBNET_GROUP": self.db_subnet_group,
             "VPC_SECURITY_GROUP_IDS": ",".join(self.vpc_security_group_ids),
-            "DB_USER": self.db_user,
             "DB_PASSWORD": self.db_password,
             "DEV_SCHEMAS": ",".join(self.dev_schemas),
             "SANITIZE_SQL_PATH": self.sanitize_sql_path,
@@ -206,47 +328,60 @@ class AuroraClone:
         self.db_password = value
         logging.info("DB_PASSWORD resolvida (fonte=ssm, param=%s).", param)
 
-    def _resolve_db_user(self) -> None:
-        """
-        DB_USER do env, ou default ao MasterUsername do DEV.
-        Não consulta o cluster PROD.
-        """
-        if self.db_user:
-            if not re.fullmatch(r"[A-Za-z0-9_]+", self.db_user):
-                raise ValueError(
-                    f"DB_USER inválido ({self.db_user!r}): use só letras, "
-                    "números e underscore."
-                )
-            logging.info("DB_USER=%s (fonte=env).", self.db_user)
-            return
-        self._require_env("DEV_IDENTIFIER")
-        master_dev = self._cluster_master_username(self.dev_id, role="DEV")
-        self.db_user = master_dev
-        logging.info(
-            "DB_USER omitido; usando MasterUsername DEV=%s.",
-            self.db_user,
-        )
-
     def _resolve_db_credentials(self) -> None:
-        """Resolve senha + user no início do passo MySQL/pipeline (idempotente)."""
+        """Resolve DB_PASSWORD (env → SSM) no início do passo (idempotente)."""
         if self._db_credentials_resolved:
             return
         self._resolve_db_password()
-        self._resolve_db_user()
         self._db_credentials_resolved = True
+
+    def _mysql_user_for(
+        self, identifier: str, *, role: str | None = None
+    ) -> str:
+        """MasterUsername do cluster (cache por identifier)."""
+        cached = self._master_username_cache.get(identifier)
+        if cached:
+            return cached
+        username = self._cluster_master_username(identifier, role=role)
+        self._master_username_cache[identifier] = username
+        return username
+
+    def _warn_if_master_dev_differs_from_prod(self) -> None:
+        """Loga se MasterUsername DEV ≠ PROD (TEMP/cutover herda PROD)."""
+        if not self.dev_id or not self.prod_id:
+            return
+        master_dev = self._mysql_user_for(self.dev_id, role="DEV")
+        master_prod = self._mysql_user_for(self.prod_id, role="PROD")
+        if master_dev == master_prod:
+            logging.info(
+                "MasterUsername DEV=PROD=%s (login operacional = master RDS).",
+                master_dev,
+            )
+            return
+        logging.warning(
+            "MasterUsername DEV (%s) ≠ PROD (%s). Dump/login no DEV usam "
+            "%s; TEMP e o DEV pós-cutover herdam o master da PROD (%s). "
+            "A senha do master no TEMP é alinhada com DB_PASSWORD. "
+            "Apps que ainda usam o nome antigo do DEV precisam atualizar o login.",
+            master_dev,
+            master_prod,
+            master_dev,
+            master_prod,
+        )
 
     def verify_dev_login(self) -> dict:
         """
-        Resolve credenciais e testa login MySQL no writer do DEV.
+        Resolve senha e testa login MySQL no writer do DEV (MasterUsername RDS).
         Retorna host/user (sem senha). Falha com RuntimeError se connect falhar.
         """
         self._require_env("DEV_IDENTIFIER")
         self._resolve_db_credentials()
         if not self.db_password:
             raise RuntimeError("DB_PASSWORD ficou vazia após resolve.")
+        user = self._mysql_user_for(self.dev_id, role="DEV")
         host = self._cluster_endpoint(self.dev_id, role="DEV")
         try:
-            with self._mysql_connect(host) as conn:
+            with self._mysql_connect(host, user=user) as conn:
                 with conn.cursor() as cur:
                     cur.execute("SELECT 1 AS ok")
                     row = cur.fetchone() or {}
@@ -257,19 +392,19 @@ class AuroraClone:
         except pymysql.Error as error:
             raise RuntimeError(
                 f"Falha ao conectar no DEV ({self.dev_id} @ {host}) "
-                f"como {self.db_user!r}: {error}. "
-                "Confira DB_USER/DB_PASSWORD e rede/SG."
+                f"como {user!r}: {error}. "
+                "Confira MasterUsername (make list-rds), DB_PASSWORD e rede/SG."
             ) from error
         logging.info(
             "Smoke login DEV ok (cluster=%s user=%s host=%s).",
             self.dev_id,
-            self.db_user,
+            user,
             host,
         )
         return {
             "cluster": self.dev_id,
             "host": host,
-            "user": self.db_user,
+            "user": user,
         }
 
     def _assert_not_prod(self, identifier: str, action: str) -> None:
@@ -479,6 +614,7 @@ class AuroraClone:
             if not shutil.which("psql"):
                 raise RuntimeError("Cliente psql não encontrado no PATH.")
             env["PGPASSWORD"] = self.db_password
+            temp_user = self._mysql_user_for(self.temp_id, role="TEMP")
             cmd = [
                 "psql",
                 "-h",
@@ -486,7 +622,7 @@ class AuroraClone:
                 "-p",
                 str(port),
                 "-U",
-                self.db_user,
+                temp_user,
                 "-d",
                 "postgres",
                 "-v",
@@ -518,6 +654,7 @@ class AuroraClone:
         elif self._is_mysql_engine(engine):
             if not shutil.which("mysql"):
                 raise RuntimeError("Cliente mysql não encontrado no PATH.")
+            temp_user = self._mysql_user_for(self.temp_id, role="TEMP")
             cmd = [
                 "mysql",
                 "-h",
@@ -525,7 +662,7 @@ class AuroraClone:
                 "-P",
                 str(port),
                 "-u",
-                self.db_user,
+                temp_user,
                 f"-p{self.db_password}",
                 "--batch",
                 "--raw",
@@ -585,21 +722,175 @@ class AuroraClone:
         self._log_sanitize_cli_output("Sanitize CLI output", combined)
         return combined
 
-    def _dump_dir_today(self) -> Path:
-        dated = datetime.now().strftime("%d%m%Y")
-        path = self.dump_base_dir / dated
-        path.mkdir(parents=True, exist_ok=True)
+    def _s3_client(self):
+        if self._s3 is None:
+            session = _aws_session(self.region)
+            self._s3 = session.client("s3", region_name=self.region)
+        return self._s3
+
+    def _ensure_run_dump_dir(self) -> Path:
+        path = ensure_run_dump_dir(self.dump_base_dir)
+        self._run_dump_dir = path
         return path
+
+    def _resolve_run_dump_dir(self) -> Path:
+        """Pasta de run existente (dump/restore/validate/archive)."""
+        global _active_run_dump_dir
+        if self._run_dump_dir is not None and self._run_dump_dir.is_dir():
+            return self._run_dump_dir
+        if _active_run_dump_dir is not None and _active_run_dump_dir.is_dir():
+            self._run_dump_dir = _active_run_dump_dir
+            return self._run_dump_dir
+        latest = latest_run_dump_dir(self.dump_base_dir)
+        if latest is None:
+            raise RuntimeError(
+                f"Nenhuma pasta de run (YYYYMMDD_HHMMSS) em "
+                f"{self.dump_base_dir}. Rode dump-dev antes."
+            )
+        self._run_dump_dir = latest
+        _active_run_dump_dir = latest
+        return latest
+
+    def _prune_old_dump_runs(self) -> None:
+        """Remove pastas sob DUMP_BASE_DIR com idade > retenção local."""
+        days = self.dump_local_retention_days
+        if days <= 0:
+            return
+        base = self.dump_base_dir
+        if not base.is_dir():
+            return
+        cutoff = datetime.now().timestamp() - (days * 86400)
+        active = None
+        if self._run_dump_dir is not None:
+            try:
+                active = self._run_dump_dir.resolve()
+            except OSError:
+                active = self._run_dump_dir
+        elif _active_run_dump_dir is not None:
+            try:
+                active = _active_run_dump_dir.resolve()
+            except OSError:
+                active = _active_run_dump_dir
+
+        for path in list(base.iterdir()):
+            if not path.is_dir():
+                continue
+            try:
+                resolved = path.resolve()
+            except OSError:
+                resolved = path
+            if active is not None and resolved == active:
+                continue
+            age_ts: float | None = None
+            if _RUN_DIR_NAME_RE.match(path.name):
+                try:
+                    age_ts = datetime.strptime(
+                        path.name, "%Y%m%d_%H%M%S"
+                    ).timestamp()
+                except ValueError:
+                    age_ts = None
+            if age_ts is None:
+                try:
+                    age_ts = path.stat().st_mtime
+                except OSError as err:
+                    logging.warning(
+                        "Falha ao inspecionar dump antigo %s: %s", path, err
+                    )
+                    continue
+            if age_ts >= cutoff:
+                continue
+            try:
+                shutil.rmtree(path)
+                logging.info("Prune dump run antigo: %s", path)
+            except OSError as err:
+                logging.warning(
+                    "Falha ao limpar dump antigo %s: %s", path, err
+                )
+
+    def start_run_file_log(self) -> Path:
+        path = start_run_file_log(self.dump_base_dir)
+        self._run_dump_dir = path
+        return path
+
+    def stop_run_file_log(self) -> None:
+        stop_run_file_log()
+
+    def release_run_dump_dir(self) -> None:
+        clear_active_run_dump_dir()
+        self._run_dump_dir = None
+
+    def archive_run_to_s3(self) -> dict:
+        """
+        Sobe pipeline.log e depois o restante da pasta de run para S3.
+        Soft-fail: erros viram warning e não propagam.
+        """
+        result: dict = {
+            "skipped": True,
+            "ok": True,
+            "uri": None,
+            "error": None,
+            "run_dir": None,
+        }
+        if not self.s3_bucket:
+            logging.info("S3_BUCKET vazio — archive S3 pulado.")
+            return result
+
+        result["skipped"] = False
+        try:
+            run_dir = self._resolve_run_dump_dir()
+        except RuntimeError as err:
+            logging.warning("Archive S3: %s", err)
+            result["ok"] = False
+            result["error"] = str(err)
+            return result
+
+        result["run_dir"] = str(run_dir)
+        try:
+            s3 = self._s3_client()
+            parts = [p for p in (self.s3_dump_prefix, run_dir.name) if p]
+            base_key = "/".join(parts)
+            log_path = run_dir / PIPELINE_LOG_NAME
+            if log_path.is_file():
+                key = f"{base_key}/{PIPELINE_LOG_NAME}"
+                s3.upload_file(str(log_path), self.s3_bucket, key)
+                logging.info(
+                    "S3 upload log: s3://%s/%s", self.s3_bucket, key
+                )
+
+            for path in sorted(run_dir.rglob("*")):
+                if not path.is_file():
+                    continue
+                if (
+                    path.name == PIPELINE_LOG_NAME
+                    and path.parent.resolve() == run_dir.resolve()
+                ):
+                    continue
+                rel = path.relative_to(run_dir).as_posix()
+                key = f"{base_key}/{rel}"
+                s3.upload_file(str(path), self.s3_bucket, key)
+                logging.info("S3 upload: s3://%s/%s", self.s3_bucket, key)
+
+            uri = f"s3://{self.s3_bucket}/{base_key}/"
+            logging.info("Archive S3 concluído: %s", uri)
+            result["uri"] = uri
+            result["ok"] = True
+            return result
+        except Exception as err:
+            logging.warning("Archive S3 falhou (continuando): %s", err)
+            result["ok"] = False
+            result["error"] = str(err)
+            return result
 
     def _mysql_connect(
         self,
         host: str,
-        user: str | None = None,
+        *,
+        user: str,
         password: str | None = None,
     ):
         return pymysql.connect(
             host=host,
-            user=user if user is not None else self.db_user,
+            user=user,
             password=password if password is not None else self.db_password,
             connect_timeout=30,
             read_timeout=120,
@@ -620,66 +911,59 @@ class AuroraClone:
         )
         self._wait_cluster(self.temp_id, "available")
 
-    def _ensure_temp_db_user(self, master_username: str) -> None:
-        """
-        Se DB_USER ≠ MasterUsername do TEMP, cria/atualiza o user operacional
-        com DB_PASSWORD e grants. Se iguais, só confirma login.
+    def _verify_temp_master_login(self) -> None:
+        """Smoke login no TEMP com MasterUsername RDS + DB_PASSWORD.
+
+        Retenta até TEMP_MASTER_LOGIN_MAX_ATTEMPTS com espera entre falhas
+        (propagação lenta de MasterUserPassword após modify_db_cluster).
         """
         self._require_env("TEMP_IDENTIFIER", "DB_PASSWORD")
-        if not self.db_user:
-            raise RuntimeError(
-                "DB_USER ausente: chame _resolve_db_credentials antes."
-            )
-        if not re.fullmatch(r"[A-Za-z0-9_]+", self.db_user):
-            raise ValueError(
-                f"DB_USER inválido ({self.db_user!r}): use só letras, "
-                "números e underscore."
-            )
-
-        endpoint = self._cluster_endpoint(self.temp_id)
-        if self.db_user == master_username:
+        user = self._mysql_user_for(self.temp_id, role="TEMP")
+        endpoint = self._cluster_endpoint(self.temp_id, role="TEMP")
+        last_error: BaseException | None = None
+        for attempt in range(1, TEMP_MASTER_LOGIN_MAX_ATTEMPTS + 1):
             logging.info(
-                "DB_USER=%s é o MasterUsername do TEMP; senha já alinhada.",
-                self.db_user,
+                "Smoke login TEMP tentativa %s/%s (master=%s host=%s)...",
+                attempt,
+                TEMP_MASTER_LOGIN_MAX_ATTEMPTS,
+                user,
+                endpoint,
             )
-            with self._mysql_connect(endpoint):
-                pass
-            logging.info("Smoke login TEMP ok (master=%s).", self.db_user)
-            return
-
-        logging.info(
-            "DB_USER=%s ≠ MasterUsername=%s; criando/atualizando user no TEMP...",
-            self.db_user,
-            master_username,
+            try:
+                with self._mysql_connect(endpoint, user=user):
+                    pass
+                logging.info(
+                    "Smoke login TEMP ok (master=%s, tentativa %s).",
+                    user,
+                    attempt,
+                )
+                return
+            except pymysql.Error as error:
+                last_error = error
+                if attempt < TEMP_MASTER_LOGIN_MAX_ATTEMPTS:
+                    logging.warning(
+                        "Smoke login TEMP falhou (tentativa %s/%s): %s. "
+                        "Aguardando %ss e retentando...",
+                        attempt,
+                        TEMP_MASTER_LOGIN_MAX_ATTEMPTS,
+                        error,
+                        TEMP_MASTER_LOGIN_RETRY_WAIT_SECONDS,
+                    )
+                    time.sleep(TEMP_MASTER_LOGIN_RETRY_WAIT_SECONDS)
+                    continue
+                raise RuntimeError(
+                    f"Falha ao conectar no TEMP ({self.temp_id} @ {endpoint}) "
+                    f"como {user!r} após {TEMP_MASTER_LOGIN_MAX_ATTEMPTS} "
+                    f"tentativas: {error}. "
+                    "Confira MasterUsername (make list-rds), DB_PASSWORD e rede/SG."
+                ) from error
+        raise RuntimeError(
+            f"Smoke login TEMP falhou: {last_error}"
         )
-        with self._mysql_connect(
-            endpoint, user=master_username, password=self.db_password
-        ) as conn:
-            # Username já validado (A-Za-z0-9_); senha escapada pela conexão.
-            quoted_password = conn.escape(self.db_password)
-            user = self.db_user
-            with conn.cursor() as cur:
-                cur.execute(
-                    f"CREATE USER IF NOT EXISTS '{user}'@'%' "
-                    f"IDENTIFIED BY {quoted_password}"
-                )
-                cur.execute(
-                    f"ALTER USER '{user}'@'%' IDENTIFIED BY {quoted_password}"
-                )
-                cur.execute(
-                    f"GRANT ALL PRIVILEGES ON *.* TO '{user}'@'%' "
-                    "WITH GRANT OPTION"
-                )
-                cur.execute("FLUSH PRIVILEGES")
-            conn.commit()
 
-        with self._mysql_connect(endpoint):
-            pass
-        logging.info("Smoke login TEMP ok (DB_USER=%s).", self.db_user)
-
-    def _list_user_schemas(self, host: str) -> list[str]:
+    def _list_user_schemas(self, host: str, *, user: str) -> list[str]:
         """Lista schemas de usuário em host (exclui SYSTEM_SCHEMAS)."""
-        with self._mysql_connect(host) as conn:
+        with self._mysql_connect(host, user=user) as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """
@@ -723,13 +1007,15 @@ class AuroraClone:
             raise
 
         try:
-            dev_schemas = self._list_user_schemas(dev_host)
-            temp_schemas = self._list_user_schemas(temp_host)
+            dev_user = self._mysql_user_for(self.dev_id, role="DEV")
+            temp_user = self._mysql_user_for(self.temp_id, role="TEMP")
+            dev_schemas = self._list_user_schemas(dev_host, user=dev_user)
+            temp_schemas = self._list_user_schemas(temp_host, user=temp_user)
         except Exception as error:
             raise RuntimeError(
                 "Falha ao listar schemas em DEV/TEMP. Confirme que TEMP "
-                "está available e acessível com DB_USER/DB_PASSWORD, ou "
-                f"defina DEV_SCHEMAS. Detalhe: {error}"
+                "está available e acessível com MasterUsername (list-rds) "
+                f"e DB_PASSWORD, ou defina DEV_SCHEMAS. Detalhe: {error}"
             ) from error
 
         only_dev = sorted(set(dev_schemas) - set(temp_schemas))
@@ -760,7 +1046,7 @@ class AuroraClone:
             )
             return list(self.dev_schemas)
 
-        dump_dir = self._dump_dir_today()
+        dump_dir = self._resolve_run_dump_dir()
         schemas = sorted(
             p.name
             for p in dump_dir.iterdir()
@@ -779,10 +1065,12 @@ class AuroraClone:
             )
         return schemas
 
-    def _table_row_counts(self, host: str, schemas: list[str]) -> dict[str, int]:
+    def _table_row_counts(
+        self, host: str, schemas: list[str], *, user: str
+    ) -> dict[str, int]:
         """Retorna mapa schema.table → COUNT(*)."""
         counts: dict[str, int] = {}
-        with self._mysql_connect(host) as conn:
+        with self._mysql_connect(host, user=user) as conn:
             with conn.cursor() as cur:
                 for schema in schemas:
                     cur.execute(
@@ -1161,7 +1449,7 @@ class AuroraClone:
         Lista clusters RDS e loga identifier, status, engine, rede e endpoint.
 
         Inclui subnet group, security groups, instance class, publico (writer)
-        e master_user (útil para conferir DB_USER no .env).
+        e master_user (login MySQL = MasterUsername do cluster; senha = DB_PASSWORD).
 
         Returns:
             Lista de dicts com os campos relevantes de cada cluster.
@@ -1279,7 +1567,7 @@ class AuroraClone:
     # ------------------------------------------------------------------
 
     def clone_prod_to_temp(self) -> None:
-        """1. Clone PROD → TEMP (PITR copy-on-write) + cria writer + credenciais DEV."""
+        """1. Clone PROD → TEMP (PITR copy-on-write) + writer + senha master TEMP."""
         self._resolve_db_credentials()
         self._require_env(
             "PROD_IDENTIFIER",
@@ -1306,6 +1594,7 @@ class AuroraClone:
                 self._cluster_not_found_message(self.dev_id, "DEV")
             )
 
+        self._warn_if_master_dev_differs_from_prod()
         placement = self._resolve_temp_placement(prod_cluster, dev_cluster)
 
         logging.info(
@@ -1344,17 +1633,26 @@ class AuroraClone:
         self._wait_instance(self.temp_id, "available")
 
         self._reset_temp_master_password()
-        master_username = self._cluster_master_username(self.temp_id)
-        self._ensure_temp_db_user(master_username)
+        self._verify_temp_master_login()
         logging.info("Clone PROD→TEMP concluído: %s", self.temp_id)
 
-    def sanitize_temp_data(self) -> None:
+    def sanitize_temp_data(
+        self,
+        *,
+        max_attempts: int = 2,
+        preserve_temp_on_failure: bool = False,
+    ) -> None:
         """
         2. Sanitize TEMP (pós-clone, pré-dump).
         Com SANITIZE_SQL_PATH: executa o .sql.
         Sem path: lista schemas (information_schema; MySQL e PostgreSQL).
-        1 retry após 60s; na 2ª falha apaga TEMP e aborta.
+
+        Defaults (pipeline / CLI): até 2 tentativas (retry 60s); na falha
+        final apaga TEMP e aborta. O game usa max_attempts=1 e
+        preserve_temp_on_failure=True para iterar no .sql sem apagar TEMP.
         """
+        if max_attempts < 1:
+            raise ValueError(f"max_attempts deve ser >= 1, got {max_attempts}")
         self._resolve_db_credentials()
         self._require_env("TEMP_IDENTIFIER", "DB_PASSWORD")
 
@@ -1391,9 +1689,11 @@ class AuroraClone:
         )
 
         last_error: BaseException | None = None
-        for attempt in (1, 2):
+        for attempt in range(1, max_attempts + 1):
             try:
-                logging.info("Sanitize tentativa %s/2...", attempt)
+                logging.info(
+                    "Sanitize tentativa %s/%s...", attempt, max_attempts
+                )
                 self._run_sanitize_cli(
                     host=endpoint,
                     port=port,
@@ -1407,29 +1707,49 @@ class AuroraClone:
                 return
             except Exception as error:
                 last_error = error
-                if attempt == 1:
+                if attempt < max_attempts:
                     logging.warning(
-                        "Sanitize falhou (tentativa 1): %s. "
+                        "Sanitize falhou (tentativa %s/%s): %s. "
                         "Aguardando %ss e retentando...",
+                        attempt,
+                        max_attempts,
                         error,
                         SANITIZE_RETRY_WAIT_SECONDS,
                     )
                     time.sleep(SANITIZE_RETRY_WAIT_SECONDS)
                     continue
-                logging.error(
-                    "Sanitize falhou (tentativa 2): %s. Apagando TEMP %s.",
-                    error,
-                    self.temp_id,
-                )
-                self._delete_cluster_and_instance(self.temp_id)
+                if preserve_temp_on_failure:
+                    logging.error(
+                        "Sanitize falhou (tentativa %s/%s): %s. "
+                        "TEMP %s preservado para inspeção.",
+                        attempt,
+                        max_attempts,
+                        error,
+                        self.temp_id,
+                    )
+                else:
+                    logging.error(
+                        "Sanitize falhou (tentativa %s/%s): %s. "
+                        "Apagando TEMP %s.",
+                        attempt,
+                        max_attempts,
+                        error,
+                        self.temp_id,
+                    )
+                    self._delete_cluster_and_instance(self.temp_id)
+                if max_attempts > 1:
+                    raise RuntimeError(
+                        f"Sanitize TEMP falhou após retry: {error}"
+                    ) from error
                 raise RuntimeError(
-                    f"Sanitize TEMP falhou após retry: {error}"
+                    f"Sanitize TEMP falhou: {error}"
                 ) from error
 
         raise RuntimeError(f"Sanitize TEMP falhou: {last_error}")
 
     def dump_dev_schemas(self) -> Path:
         """3. Dump dos schemas DEV com mydumper."""
+        self._prune_old_dump_runs()
         self._resolve_db_credentials()
         self._require_env(
             "PROD_IDENTIFIER",
@@ -1439,11 +1759,13 @@ class AuroraClone:
         )
         schemas = self._resolve_dev_only_schemas()
         endpoint = self._cluster_endpoint(self.dev_id)
-        dump_dir = self._dump_dir_today()
+        user = self._mysql_user_for(self.dev_id, role="DEV")
+        dump_dir = self._ensure_run_dump_dir()
         logging.info(
-            "Dump DEV %s (%s) schemas=%s → %s",
+            "Dump DEV %s (%s user=%s) schemas=%s → %s",
             self.dev_id,
             endpoint,
+            user,
             schemas,
             dump_dir,
         )
@@ -1455,7 +1777,7 @@ class AuroraClone:
                 "-h",
                 endpoint,
                 "-u",
-                self.db_user,
+                user,
                 "-p",
                 self.db_password,
                 "-B",
@@ -1486,26 +1808,29 @@ class AuroraClone:
         )
         schemas = self._resolve_dev_only_schemas()
         endpoint = self._cluster_endpoint(self.temp_id)
-        dump_dir = self._dump_dir_today()
+        user = self._mysql_user_for(self.temp_id, role="TEMP")
+        dump_dir = self._resolve_run_dump_dir()
         logging.info(
-            "Restore dump %s → TEMP %s (%s) schemas=%s",
+            "Restore dump %s → TEMP %s (%s user=%s) schemas=%s",
             dump_dir,
             self.temp_id,
             endpoint,
+            user,
             schemas,
         )
         for schema in schemas:
             schema_dir = dump_dir / schema
             if not schema_dir.is_dir():
                 raise RuntimeError(
-                    f"Pasta de dump ausente para schema {schema}: {schema_dir}"
+                    f"Pasta de dump ausente para schema {schema}: "
+                    f"{schema_dir} (run YYYYMMDD_HHMMSS)"
                 )
             cmd = [
                 "myloader",
                 "-h",
                 endpoint,
                 "-u",
-                self.db_user,
+                user,
                 "-p",
                 self.db_password,
                 "-d",
@@ -1533,17 +1858,25 @@ class AuroraClone:
         schemas = self._resolve_restored_schemas()
         dev_host = self._cluster_endpoint(self.dev_id)
         temp_host = self._cluster_endpoint(self.temp_id)
+        dev_user = self._mysql_user_for(self.dev_id, role="DEV")
+        temp_user = self._mysql_user_for(self.temp_id, role="TEMP")
         logging.info(
-            "Validando row counts DEV (%s) vs TEMP (%s), schemas=%s, "
-            "tolerância=%s",
+            "Validando row counts DEV (%s user=%s) vs TEMP (%s user=%s), "
+            "schemas=%s, tolerância=%s",
             dev_host,
+            dev_user,
             temp_host,
+            temp_user,
             schemas,
             self.row_diff_tolerance,
         )
         try:
-            dev_counts = self._table_row_counts(dev_host, schemas)
-            temp_counts = self._table_row_counts(temp_host, schemas)
+            dev_counts = self._table_row_counts(
+                dev_host, schemas, user=dev_user
+            )
+            temp_counts = self._table_row_counts(
+                temp_host, schemas, user=temp_user
+            )
         except Exception:
             logging.error(
                 "Falha ao ler counts; apagando TEMP %s e abortando.",
@@ -1605,7 +1938,7 @@ class AuroraClone:
         )
 
         if divergences:
-            artifact = self._dump_dir_today() / "validate_divergences.txt"
+            artifact = self._resolve_run_dump_dir() / "validate_divergences.txt"
             lines = [
                 f"{d['table']}: DEV={d['dev']} TEMP={d['temp']} "
                 f"|diff|={d['diff']} > tolerância={self.row_diff_tolerance}"
@@ -1681,18 +2014,25 @@ class AuroraClone:
         logging.info("Delete OLD concluído.")
 
     def run_pipeline(self) -> None:
-        """Executa passos 1→8 na ordem."""
-        logging.info("=== Pipeline Aurora Clone: início ===")
-        self._resolve_db_credentials()
-        self.clone_prod_to_temp()
-        self.sanitize_temp_data()
-        self.dump_dev_schemas()
-        self.restore_dump_to_temp()
-        self.validate_dev_vs_temp()
-        self.rename_dev_to_old()
-        self.rename_temp_to_dev()
-        self.delete_old_dev()
-        logging.info("=== Pipeline Aurora Clone: concluída ===")
+        """Executa passos 1→8 na ordem; archive S3 no finally se S3_BUCKET."""
+        self._prune_old_dump_runs()
+        self.start_run_file_log()
+        try:
+            logging.info("=== Pipeline Aurora Clone: início ===")
+            self._resolve_db_credentials()
+            self.clone_prod_to_temp()
+            self.sanitize_temp_data()
+            self.dump_dev_schemas()
+            self.restore_dump_to_temp()
+            self.validate_dev_vs_temp()
+            self.rename_dev_to_old()
+            self.rename_temp_to_dev()
+            self.delete_old_dev()
+            logging.info("=== Pipeline Aurora Clone: concluída ===")
+        finally:
+            self.stop_run_file_log()
+            self.archive_run_to_s3()
+            self.release_run_dump_dir()
 
 
 def build_parser() -> argparse.ArgumentParser:
