@@ -250,7 +250,8 @@ Exemplos de nomes: `vpc-lab-aurora-clone-boto3-mysql-prod`, `vpc-lab-aurora-clon
 
 Configuração econômica: Serverless v2 com **min 0 ACU / max 1 ACU** e **auto-pause após 10 minutos** sem conexão (`seconds_until_auto_pause = 600`). Se o lab ficar ocioso, o cluster pausa e para de consumir ACU; a próxima conexão pode demorar (cold start). Mesmo assim, rode `destroy` ao terminar o teste.
 
->>> Aviso: há custo enquanto a infra existir (mesmo pausado: storage/backup mínimos)
+> [!WARNING]
+> **Há custo enquanto a infra existir** — mesmo com o cluster pausado (storage e backup mínimos). Rode `destroy` ao terminar o teste.
 
 ### Subir
 
