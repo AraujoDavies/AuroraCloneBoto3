@@ -4,13 +4,13 @@ __pycache__/
 .venv/
 dumps/
 .aurora_game_checkpoint
+.aurora_scheduler.lock
 policy.json
 .DS_Store
 .idea/
 .pytest_cache/
 .ruff_cache/
 .vscode/
-*.md
 
 # Terraform (lab infra)
 **/.terraform/

@@ -1,15 +1,25 @@
 # Exemplo: copie para docker-compose.yml
-# Uso: docker compose run --rm aurora-clone
-# Shell interativo com o projeto montado em /app (código, .env, dumps).
+# Imagem local: docker build -t aurora-clone .
+#
+# Pipeline agendado (container sempre online):
+#   docker compose up -d aurora-scheduler
+#   docker compose logs -f aurora-scheduler
 
 services:
-  aurora-clone:
-    build: .
+  aurora-scheduler:
+    image: aurora-clone
     env_file:
       - .env
     volumes:
       - .:/app
     working_dir: /app
-    stdin_open: true
-    tty: true
-    command: ["bash"]
+    restart: unless-stopped
+    environment:
+      TZ: America/Sao_Paulo
+      # Diário 03:00:        0 3 * * *
+      # Semanal dom 03:00:   0 3 * * 0
+      # Mensal dia 1 03:00:  0 3 1 * *
+      # https://crontab.guru/ for more information
+      SCHEDULE_CRON: "0 3 * * *"
+      SCHEDULE_COMMAND: "make PYTHON=python pipeline"
+    command: ["python", "scheduler.py"]

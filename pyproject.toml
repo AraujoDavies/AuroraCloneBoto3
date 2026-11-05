@@ -8,6 +8,7 @@ authors = [
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "croniter (>=5.0.0,<6.0.0)",
     "boto3 (>=1.43.118,<2.0.0)",
     "python-dotenv (>=1.2.4,<2.0.0)",
     "pymysql (>=1.1.0,<2.0.0)",
