@@ -50,6 +50,8 @@ CHECKPOINT_PATH = Path(".aurora_game_checkpoint")
 NO_ANIM = False
 # Etapa removida — filtrar de checkpoints antigos.
 _OBSOLETE_STAGE_IDS = frozenset({"dotenv"})
+# WhoAmI/Radar: falha exige ajuste no .env + restart do container (sem retry in-game).
+_FATAL_RECON_STAGE_IDS = frozenset({"whoami", "radar"})
 
 # ---------------------------------------------------------------------------
 # ANSI / TTY
@@ -457,7 +459,7 @@ def _radar_env_mismatch_error(
         )
     lines.append(
         f"Edite o .env ({env_hint}) com o valor correspondente "
-        "e use [r] retry."
+        "e reinicie o container."
     )
     return RuntimeError("\n".join(lines))
 
@@ -755,15 +757,15 @@ STAGES: list[Stage] = [
         hints=[
             "Preencha AWS_ACCESS_KEY_ID e AWS_SECRET_ACCESS_KEY no .env.",
             "Defina AWS_DEFAULT_REGION (ou AWS_REGION).",
-            "Salve o .env e use [r] retry — sem reiniciar o container.",
+            "Salve o .env e reinicie o container antes de jogar de novo.",
             "Teste: make PYTHON=python account-aws",
         ],
         run=_check_whoami,
         needs_app=True,
         sample_errors=[
             "Faltam variáveis de ambiente no .env: AWS_ACCESS_KEY_ID, "
-            "AWS_SECRET_ACCESS_KEY, AWS_DEFAULT_REGION. Edite o .env e use "
-            "[r] retry (sem reiniciar o container).",
+            "AWS_SECRET_ACCESS_KEY, AWS_DEFAULT_REGION. Edite o .env e "
+            "reinicie o container.",
             "Credenciais AWS inválidas: o Secret Access Key não confere com o "
             "Access Key ID (valor errado, truncado ou com aspas/espaço extra no .env).",
         ],
@@ -782,7 +784,7 @@ STAGES: list[Stage] = [
             "Ou altere AWS_DEFAULT_REGION no .env.",
             "Se os bancos existirem: ajuste PROD_IDENTIFIER e "
             "DEV_IDENTIFIER no .env para os identifiers listados.",
-            "Preencha também TEMP_IDENTIFIER; salve e use [r] retry.",
+            "Preencha também TEMP_IDENTIFIER; salve o .env e reinicie o container.",
             "Teste: make PYTHON=python list-rds",
         ],
         run=_check_radar,
@@ -794,7 +796,7 @@ STAGES: list[Stage] = [
             "Ou altere AWS_DEFAULT_REGION no .env.",
             "Os bancos existem na região, mas as variáveis de ambiente "
             "não correspondem. Edite o .env (PROD_IDENTIFIER e/ou "
-            "DEV_IDENTIFIER) com o valor correspondente e use [r] retry.",
+            "DEV_IDENTIFIER) com o valor correspondente e reinicie o container.",
         ],
     ),
     Stage(
@@ -1547,32 +1549,46 @@ _AWS_CREDENTIAL_FIX_HINTS = [
     "Teste: make PYTHON=python account-aws",
 ]
 
+_AWS_CREDENTIAL_FATAL_HINTS = [
+    "Confira AWS_ACCESS_KEY_ID e AWS_SECRET_ACCESS_KEY no .env (sem aspas, sem espaço no fim).",
+    "Se a chave foi rotacionada no IAM, use o Secret da chave ativa (só aparece na criação).",
+    "Salve o .env e reinicie o container antes de jogar de novo.",
+    "Teste: make PYTHON=python account-aws",
+]
 
-def _format_stage_error(error: BaseException) -> tuple[str, list[str] | None]:
+
+def _format_stage_error(
+    error: BaseException,
+    *,
+    fatal_recon: bool = False,
+) -> tuple[str, list[str] | None]:
     """Mensagem curta para a UI; hints extras quando for erro de credencial AWS."""
+    cred_hints = (
+        _AWS_CREDENTIAL_FATAL_HINTS if fatal_recon else _AWS_CREDENTIAL_FIX_HINTS
+    )
     if isinstance(error, ClientError):
         code = (error.response.get("Error") or {}).get("Code") or ""
         if code == "SignatureDoesNotMatch":
             return (
                 "Credenciais AWS inválidas: o Secret Access Key não confere com o "
                 "Access Key ID (valor errado, truncado ou com aspas/espaço extra no .env).",
-                list(_AWS_CREDENTIAL_FIX_HINTS),
+                list(cred_hints),
             )
         if code in ("InvalidClientTokenId", "InvalidAccessKeyId"):
             return (
                 "Access Key ID inválido, inexistente ou desativado no IAM.",
-                list(_AWS_CREDENTIAL_FIX_HINTS),
+                list(cred_hints),
             )
         if code == "UnrecognizedClientException":
             return (
                 "Credenciais AWS não reconhecidas — confira Access Key e região.",
-                list(_AWS_CREDENTIAL_FIX_HINTS),
+                list(cred_hints),
             )
         if code == "ExpiredToken":
             return (
                 "Token de sessão AWS expirado — renove credenciais temporárias e "
                 "atualize AWS_SESSION_TOKEN no .env.",
-                list(_AWS_CREDENTIAL_FIX_HINTS)
+                list(cred_hints)
                 + ["Credenciais temporárias exigem AWS_SESSION_TOKEN além de KEY/SECRET."],
             )
         if code in ("AccessDenied", "AccessDeniedException"):
@@ -1632,19 +1648,30 @@ def _format_stage_error(error: BaseException) -> tuple[str, list[str] | None]:
     return msg, None
 
 
-def fail_screen(
+def _write_stage_failure(
     stage: Stage,
     error: BaseException,
     cleared: list[str],
-) -> str:
+    *,
+    fatal_recon: bool,
+) -> None:
     clear_screen()
     write(c(" ╔══════════════════════════════════════════════╗", RED, BOLD))
-    write(c(" ║           FALHA — etapa interrompida         ║", RED, BOLD))
+    if fatal_recon:
+        write(
+            c(
+                " ║      FALHA — reconhecimento interrompido     ║",
+                RED,
+                BOLD,
+            )
+        )
+    else:
+        write(c(" ║           FALHA — etapa interrompida         ║", RED, BOLD))
     write(c(" ╚══════════════════════════════════════════════╝", RED, BOLD))
     write()
     meta = ACT_META[stage.act]
     write(c(f"  Fase: [{meta['num']}] {meta['title']} · {stage.title}", YELLOW))
-    message, extra_hints = _format_stage_error(error)
+    message, extra_hints = _format_stage_error(error, fatal_recon=fatal_recon)
     write(c("  Erro: ", RED, BOLD) + message)
     write()
     write(c("  O que fazer:", WHITE, BOLD))
@@ -1658,6 +1685,34 @@ def fail_screen(
     else:
         write(c("  Checkpoint: (nenhum)", CYAN))
     write()
+    if fatal_recon:
+        write(
+            c(
+                "  Ajuste o .env e reinicie o container; o jogo será encerrado.",
+                YELLOW,
+                BOLD,
+            )
+        )
+        write()
+
+
+def fatal_fail_screen(
+    stage: Stage,
+    error: BaseException,
+    cleared: list[str],
+) -> None:
+    """WhoAmI/Radar: sem retry — Enter encerra o processo."""
+    _write_stage_failure(stage, error, cleared, fatal_recon=True)
+    pause("  [ Enter = sair ] ")
+    sys.exit(1)
+
+
+def fail_screen(
+    stage: Stage,
+    error: BaseException,
+    cleared: list[str],
+) -> str:
+    _write_stage_failure(stage, error, cleared, fatal_recon=False)
     write(c("  [r] retry esta etapa", GREEN))
     write(c("  [c] continue / voltar ao hub", CYAN))
     write(c("  [q] quit", DIM))
@@ -1841,6 +1896,8 @@ def run_stage(
                     simulated = simulate_error_menu(stage)
                     if simulated is None:
                         continue
+                    if stage.id in _FATAL_RECON_STAGE_IDS:
+                        fatal_fail_screen(stage, simulated, cleared)
                     choice = fail_screen(stage, simulated, cleared)
                     if choice == "q":
                         return "quit", cleared, None, False
@@ -1919,6 +1976,8 @@ def run_stage(
             if isinstance(error, (KeyboardInterrupt, SystemExit)):
                 raise
             _quiet_logging()
+            if stage.id in _FATAL_RECON_STAGE_IDS:
+                fatal_fail_screen(stage, error, cleared)
             choice = fail_screen(stage, error, cleared)
             if choice == "q":
                 return "quit", cleared, None, False
