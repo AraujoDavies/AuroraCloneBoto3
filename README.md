@@ -53,11 +53,14 @@ Na primeira vez, faça o clone do repo + build da imagem:
 
 ```bash
 git clone https://github.com/AraujoDavies/AuroraCloneBoto3.git
-
+```
+```bash
 cd AuroraCloneBoto3
-
+```
+```bash
 cp .env.example .env
-
+```
+```bash
 docker build -t aurora-clone .
 ```
 
