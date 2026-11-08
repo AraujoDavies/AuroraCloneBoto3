@@ -272,7 +272,11 @@ dentro do container...
 
 ```bash
 # Pré-requisito: shell aberto após docker run com --env-file .env (credenciais AWS no .env)
-cd infra/mysql # ou cd infra/postgres
+cd infra/mysql 
+# ou cd infra/postgres
+```
+
+```bash
 cp terraform.tfvars.example terraform.tfvars
 ```
 Edite o arquivo terraform.tfvars caso queira mudar a senha, valor padrão do lab é:
@@ -285,7 +289,11 @@ Suba a infra com terraform
 
 ```bash
 terraform init
+```
+```bash
 terraform apply
+```
+```bash
 terraform output
 ```
 
@@ -310,7 +318,10 @@ Rede do TEMP (subnet/SG/class/público) **herda do DEV** por padrão.
 Ainda no container. Derruba clusters PROD/DEV do lab, VPCs e para a cobrança. Antes de soltar a rede do DEV, o destroy também tenta apagar clusters **TEMP** e **OLD** (criados pelo clone/rename fora do state), usando os identificadores do `terraform.tfvars` — cluster ausente não interrompe o fluxo.
 
 ```bash
-cd infra/mysql   # ou infra/postgres
+cd infra/mysql   
+# ou infra/postgres
+```
+```bash
 terraform destroy
 ```
 
