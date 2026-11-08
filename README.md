@@ -398,7 +398,7 @@ No fim de `make pipeline` (e na etapa **ArchiveS3** do game), se `S3_BUCKET` est
 | `S3_BUCKET` | Bucket de arquivo dos runs | Upload no fim da pipeline / etapa ArchiveS3 | Sem upload (ArchiveS3 conclui como “pulado”) |
 | `S3_DUMP_PREFIX` | Prefixo de chave S3 (ex.: `aurora-clone/dev`) | Objetos em `s3://bucket/prefix/YYYYMMDD_HHMMSS/…` | Objetos em `s3://bucket/YYYYMMDD_HHMMSS/…` |
 
-**Recomendação:** criar um **bucket dedicado** (não misturar com assets públicos), com **Block Public Access** ligado e **S3 Lifecycle** expirando objetos atuais em ~**30 dias**. A retenção local (`DUMP_LOCAL_RETENTION_DAYS`, default 15) é independente do lifecycle do bucket. Inclua `s3:PutObject` (e multipart) na role do job — `make generate-policy` adiciona o statement quando `S3_BUCKET` está no `.env` (ver [`role.md`](role.md)).
+**Recomendação:** criar um **bucket dedicado** (não misturar com assets públicos), com **Block Public Access** ligado e **S3 Lifecycle** expirando objetos atuais em ~**30 dias**. A retenção local (`DUMP_LOCAL_RETENTION_DAYS`, default 15) é independente do lifecycle do bucket. Inclua `s3:PutObject` (e multipart) na role do job quando `S3_BUCKET` estiver setada (ver `policy-clone-minimo.json`). `make generate-policy` gera só o Deny da PROD (`AvoidDeleteAuroraCloneBoto3`).
 
 ### Segurança operacional
 

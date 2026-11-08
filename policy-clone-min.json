@@ -1,0 +1,61 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ObrigatorioRdsClonePipeline",
+      "Effect": "Allow",
+      "Action": [
+        "rds:DescribeDBClusters",
+        "rds:DescribeDBInstances",
+        "rds:RestoreDBClusterToPointInTime",
+        "rds:CreateDBInstance",
+        "rds:ModifyDBCluster",
+        "rds:ModifyDBInstance",
+        "rds:DeleteDBInstance",
+        "rds:DeleteDBCluster",
+        "rds:AddTagsToResource"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "ObrigatorioIamCheckAvoidDeletePolicy",
+      "Effect": "Allow",
+      "Action": [
+        "iam:ListPolicies",
+        "iam:ListAttachedRolePolicies",
+        "iam:ListAttachedUserPolicies"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "OpcionalS3ArchiveDumpsSeS3Bucket",
+      "Effect": "Allow",
+      "Action": [
+        "s3:PutObject",
+        "s3:AbortMultipartUpload",
+        "s3:ListMultipartUploadParts",
+        "s3:ListBucket"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "OpcionalSsmSenhaSeDbPasswordSsmParam",
+      "Effect": "Allow",
+      "Action": [
+        "ssm:GetParameter",
+        "ssm:GetParameters"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "OpcionalKmsSecureStringOuClusterCriptografado",
+      "Effect": "Allow",
+      "Action": [
+        "kms:Decrypt",
+        "kms:DescribeKey",
+        "kms:CreateGrant"
+      ],
+      "Resource": "*"
+    }
+  ]
+}

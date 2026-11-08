@@ -1,4 +1,4 @@
-"""Gera a policy IAM do role.md com ARNs reais (conta STS + .env) e imprime JSON."""
+"""Gera a policy AvoidDeleteAuroraCloneBoto3: Deny de delete/rename só na PROD."""
 
 from __future__ import annotations
 
@@ -44,11 +44,6 @@ def _rds_instance_arn(region: str, account: str, identifier: str) -> str:
     return f"arn:aws:rds:{region}:{account}:db:{identifier}"
 
 
-def _ssm_parameter_arn(region: str, account: str, path: str) -> str:
-    normalized = path if path.startswith("/") else f"/{path}"
-    return f"arn:aws:ssm:{region}:{account}:parameter{normalized}"
-
-
 def _account_id() -> str:
     try:
         identity = boto3.client("sts").get_caller_identity()
@@ -62,153 +57,43 @@ def _account_id() -> str:
     return account
 
 
-def build_policy(
-    region: str,
-    account: str,
-    prod_id: str,
-    temp_id: str,
-    dev_id: str,
-    old_id: str,
-    ssm_param: str,
-    s3_bucket: str = "",
-    s3_prefix: str = "",
-) -> dict:
-    statements: list[dict] = [
-        {
-            "Sid": "DescribeRds",
-            "Effect": "Allow",
-            "Action": [
-                "rds:DescribeDBClusters",
-                "rds:DescribeDBInstances",
-            ],
-            "Resource": "*",
-        },
-        {
-            "Sid": "CloneProdToTemp",
-            "Effect": "Allow",
-            "Action": ["rds:RestoreDBClusterToPointInTime"],
-            "Resource": [
-                _rds_cluster_arn(region, account, prod_id),
-                _rds_cluster_arn(region, account, temp_id),
-            ],
-        },
-        {
-            "Sid": "ManageTempDevOld",
-            "Effect": "Allow",
-            "Action": [
-                "rds:CreateDBInstance",
-                "rds:ModifyDBCluster",
-                "rds:ModifyDBInstance",
-                "rds:DeleteDBInstance",
-                "rds:DeleteDBCluster",
-                "rds:AddTagsToResource",
-            ],
-            "Resource": [
-                _rds_cluster_arn(region, account, temp_id),
-                _rds_instance_arn(region, account, temp_id),
-                _rds_cluster_arn(region, account, dev_id),
-                _rds_instance_arn(region, account, dev_id),
-                _rds_cluster_arn(region, account, old_id),
-                _rds_instance_arn(region, account, old_id),
-            ],
-        },
-        {
-            "Sid": "DenyDeleteOrRenameProd",
-            "Effect": "Deny",
-            "Action": [
-                "rds:DeleteDBCluster",
-                "rds:DeleteDBInstance",
-                "rds:ModifyDBCluster",
-                "rds:ModifyDBInstance",
-            ],
-            "Resource": [
-                _rds_cluster_arn(region, account, prod_id),
-                _rds_instance_arn(region, account, prod_id),
-            ],
-        },
+def build_policy(region: str, account: str, prod_id: str) -> dict:
+    """Deny de delete e modify no cluster e na instância de PROD."""
+    prod_arns = [
+        _rds_cluster_arn(region, account, prod_id),
+        _rds_instance_arn(region, account, prod_id),
     ]
-
-    if ssm_param:
-        statements.append(
+    return {
+        "Version": "2012-10-17",
+        "Statement": [
             {
-                "Sid": "ReadDbPasswordFromSsm",
-                "Effect": "Allow",
+                "Sid": "DenyDeleteOrRenameProd",
+                "Effect": "Deny",
                 "Action": [
-                    "ssm:GetParameter",
-                    "ssm:GetParameters",
+                    "rds:DeleteDBCluster",
+                    "rds:DeleteDBInstance",
+                    "rds:ModifyDBCluster",
+                    "rds:ModifyDBInstance",
                 ],
-                "Resource": [
-                    _ssm_parameter_arn(region, account, ssm_param),
-                ],
+                "Resource": prod_arns,
             }
-        )
-
-    if s3_bucket:
-        prefix = (s3_prefix or "").strip().strip("/")
-        object_arn = (
-            f"arn:aws:s3:::{s3_bucket}/{prefix}/*"
-            if prefix
-            else f"arn:aws:s3:::{s3_bucket}/*"
-        )
-        statements.append(
-            {
-                "Sid": "PutDumpArchiveToS3",
-                "Effect": "Allow",
-                "Action": [
-                    "s3:PutObject",
-                    "s3:AbortMultipartUpload",
-                    "s3:ListMultipartUploadParts",
-                ],
-                "Resource": [object_arn],
-            }
-        )
-        list_statement: dict = {
-            "Sid": "ListDumpArchiveBucket",
-            "Effect": "Allow",
-            "Action": ["s3:ListBucket"],
-            "Resource": [f"arn:aws:s3:::{s3_bucket}"],
-        }
-        if prefix:
-            list_statement["Condition"] = {
-                "StringLike": {"s3:prefix": [f"{prefix}/*", prefix]}
-            }
-        statements.append(list_statement)
-
-    return {"Version": "2012-10-17", "Statement": statements}
+        ],
+    }
 
 
 def main() -> None:
     region = _env("AWS_DEFAULT_REGION", "AWS_REGION")
     prod_id = _env("PROD_IDENTIFIER")
-    temp_id = _env("TEMP_IDENTIFIER")
-    dev_id = _env("DEV_IDENTIFIER")
-    old_id = _env("OLD_IDENTIFIER")
-    ssm_param = _env("DB_PASSWORD_SSM_PARAM")
-    s3_bucket = _env("S3_BUCKET")
-    s3_prefix = _env("S3_DUMP_PREFIX")
 
     _require_env(
         {
             "AWS_DEFAULT_REGION|AWS_REGION": region,
             "PROD_IDENTIFIER": prod_id,
-            "DEV_IDENTIFIER": dev_id,
-            "TEMP_IDENTIFIER": temp_id,
-            "OLD_IDENTIFIER": old_id,
         }
     )
 
     account = _account_id()
-    policy = build_policy(
-        region=region,
-        account=account,
-        prod_id=prod_id,
-        temp_id=temp_id,
-        dev_id=dev_id,
-        old_id=old_id,
-        ssm_param=ssm_param,
-        s3_bucket=s3_bucket,
-        s3_prefix=s3_prefix,
-    )
+    policy = build_policy(region=region, account=account, prod_id=prod_id)
     payload = json.dumps(policy, indent=2) + "\n"
     OUTPUT_PATH.write_text(payload, encoding="utf-8")
     saved_msg = f"Arquivo Salvo: {OUTPUT_PATH}"
@@ -222,4 +107,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

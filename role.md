@@ -40,7 +40,7 @@ Se o job grava dumps/logs no S3 (`S3_BUCKET` no `.env`):
 1. Prefira um **bucket dedicado**, Block Public Access **on**, sem ACL pública.
 2. Configure **Lifecycle** para expirar versões atuais em ~**30 dias** (a retenção local no disco é outra: `DUMP_LOCAL_RETENTION_DAYS`, default 15).
 3. Restrinja Put ao prefixo (`S3_DUMP_PREFIX`) quando possível.
-4. `python generate_policy.py` / `make generate-policy` inclui o Allow S3 quando `S3_BUCKET` está setada.
+4. O Allow de S3 fica na policy mínima do job (`policy-clone-minimo.json`), não em `make generate-policy`.
 
 ---
 
@@ -80,7 +80,7 @@ Gere a policy com os ARNs reais da conta via:
 make generate-policy
 ```
 
-Isso usa STS + `.env` e escreve `policy.json` (inclui o Allow S3 se `S3_BUCKET` estiver setada). O JSON abaixo é só o esqueleto de referência: troque `ACCOUNT_ID`, `REGION` e os identificadores se for montar na mão. O Deny na PROD deve vir **junto** com Allows limitados — Deny vence Allow na avaliação IAM.
+Isso usa STS + `PROD_IDENTIFIER` e escreve `policy.json` só com o Deny de delete/rename na PROD (policy `AvoidDeleteAuroraCloneBoto3`). Os Allows do job ficam em `policy-clone-minimo.json`. O JSON abaixo é o esqueleto completo de referência, se for montar Allows e Deny na mesma policy à mão.
 
 ```json
 {
@@ -162,7 +162,7 @@ Notas:
 - O Deny de `Modify*` na PROD impede rename acidental da produção. O clone (`RestoreDBClusterToPointInTime`) **não** precisa de Modify na PROD.
 - Se o Allow de Create/Delete usar tags (`aws:ResourceTag/...`), mantenha o Deny por ARN da PROD mesmo assim.
 - O statement SSM cobre `DB_PASSWORD_SSM_PARAM` quando `DB_PASSWORD` não está no env; ajuste o ARN ao path real.
-- Se `S3_BUCKET` estiver setada, acrescente PutObject (e multipart) no prefixo do bucket — o gerador de policy já faz isso.
+- Se `S3_BUCKET` estiver setada, o Allow de PutObject (e multipart) fica em `policy-clone-minimo.json`. `make generate-policy` não inclui S3.
 
 ---
 

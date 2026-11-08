@@ -16,7 +16,7 @@ help:
 	$(PYTHON) $(SCRIPT) --help
 	@echo ""
 	@echo "Alvos Make extras:"
-	@echo "  make generate-policy   Gera policy.json (ARNs reais via STS + .env)"
+	@echo "  make generate-policy   Gera policy.json (Deny na PROD, ARNs via STS + .env)"
 	@echo "  make game              Operação Aurora (campanha; TTY no container -it)"
 
 requirements-txt:
