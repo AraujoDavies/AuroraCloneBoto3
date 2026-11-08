@@ -3,7 +3,7 @@ Aurora Clone — versão pública.
 
 Pipeline: clone PROD→TEMP, sanitize TEMP, dump DEV, restore→TEMP,
 validate, rename DEV→OLD / TEMP→DEV, delete OLD.
-Pré-voo: inventário RDS + policy IAM AvoidDeleteAuroraCloneBoto3.
+Pré-voo: inventário RDS.
 """
 
 from __future__ import annotations
@@ -39,7 +39,6 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s: %(message)s",
 )
 
-AVOID_DELETE_POLICY_NAME = "AvoidDeleteAuroraCloneBoto3"
 POLL_INTERVAL_SECONDS = 30
 SANITIZE_RETRY_WAIT_SECONDS = 60
 TEMP_MASTER_LOGIN_MAX_ATTEMPTS = 5
@@ -226,10 +225,9 @@ class AuroraClone:
         except Exception as error:
             raise RuntimeError(f"boto3 RDS Failed: {error}") from error
         try:
-            self.iam = session.client("iam")
             self.sts = session.client("sts")
         except Exception as error:
-            raise RuntimeError(f"boto3 IAM/STS Failed: {error}") from error
+            raise RuntimeError(f"boto3 STS Failed: {error}") from error
         try:
             self.ssm = session.client("ssm", region_name=region)
         except Exception as error:
@@ -1509,109 +1507,6 @@ class AuroraClone:
         )
         return identity
 
-    def _find_managed_policy_by_name(self, policy_name: str) -> dict | None:
-        """Localiza policy gerenciada (customer) pelo nome. Retorna None se não existir."""
-        paginator = self.iam.get_paginator("list_policies")
-        for page in paginator.paginate(Scope="Local"):
-            for policy in page.get("Policies") or []:
-                if policy.get("PolicyName") == policy_name:
-                    return policy
-        return None
-
-    def _caller_has_policy_attached(self, policy_arn: str) -> bool:
-        """True se a identity atual (role ou user) tem a policy anexada."""
-        identity = self.sts.get_caller_identity()
-        caller_arn = identity["Arn"]
-        account = identity.get("Account") or ""
-        if ":assumed-role/" in caller_arn:
-            role_name = caller_arn.split(":assumed-role/")[1].split("/")[0]
-            paginator = self.iam.get_paginator("list_attached_role_policies")
-            for page in paginator.paginate(RoleName=role_name):
-                for attached in page.get("AttachedPolicies") or []:
-                    if attached.get("PolicyArn") == policy_arn:
-                        return True
-            return False
-        if ":user/" in caller_arn:
-            user_name = caller_arn.rsplit("/", 1)[-1]
-            paginator = self.iam.get_paginator("list_attached_user_policies")
-            for page in paginator.paginate(UserName=user_name):
-                for attached in page.get("AttachedPolicies") or []:
-                    if attached.get("PolicyArn") == policy_arn:
-                        return True
-            return False
-        logging.warning(
-            "Identity atual não é role nem user IAM reconhecível: %s",
-            mask_account_in_text(caller_arn, account),
-        )
-        return False
-
-    def check_avoid_delete_policy(
-        self, policy_name: str = AVOID_DELETE_POLICY_NAME
-    ) -> dict:
-        """
-        Checa se a policy IAM existe e se está ativa (anexada à identity atual).
-
-        Returns:
-            Dict com exists, active, policy_arn e attached_to_caller.
-        """
-        logging.info("Checando policy IAM '%s'...", policy_name)
-        result = {
-            "policy_name": policy_name,
-            "exists": False,
-            "active": False,
-            "attached_to_caller": False,
-            "policy_arn": None,
-        }
-        try:
-            policy = self._find_managed_policy_by_name(policy_name)
-        except Exception as error:
-            logging.error("Falha ao listar policies IAM: %s", error)
-            raise
-
-        if not policy:
-            logging.warning(
-                "Policy '%s': NÃO encontrada na conta (customer managed).",
-                policy_name,
-            )
-            return result
-
-        policy_arn = policy.get("Arn")
-        result["exists"] = True
-        result["policy_arn"] = policy_arn
-        account = (self.sts.get_caller_identity().get("Account") or "").strip()
-        logging.info(
-            "Policy '%s': encontrada. ARN=%s | AttachmentCount=%s | DefaultVersion=%s",
-            policy_name,
-            mask_account_in_text(policy_arn, account),
-            policy.get("AttachmentCount"),
-            policy.get("DefaultVersionId"),
-        )
-
-        try:
-            attached_to_caller = self._caller_has_policy_attached(policy_arn)
-        except Exception as error:
-            logging.error(
-                "Falha ao verificar anexação da policy na identity atual: %s",
-                error,
-            )
-            raise
-
-        result["attached_to_caller"] = attached_to_caller
-        result["active"] = attached_to_caller
-
-        if attached_to_caller:
-            logging.info(
-                "Policy '%s': ATIVA (anexada à identity atual).", policy_name
-            )
-        else:
-            logging.warning(
-                "Policy '%s': existe, mas NÃO está ativa na identity atual "
-                "(não anexada à role/user que está executando).",
-                policy_name,
-            )
-
-        return result
-
     def _writer_instance_info(
         self, cluster: dict
     ) -> tuple[str | None, str | None, bool | None]:
@@ -2555,7 +2450,6 @@ def build_parser() -> argparse.ArgumentParser:
         "account-aws",
         help="Mostra Account/Arn AWS em uso (account mascarado nos logs)",
     )
-    sub.add_parser("check-policy", help="Checa policy AvoidDeleteAuroraCloneBoto3")
     sub.add_parser("list-rds", help="Lista clusters RDS e engines")
     sub.add_parser("clone-prod-to-temp", help="1. Clone PROD → TEMP")
     sub.add_parser(
@@ -2589,16 +2483,6 @@ def main(argv: list[str] | None = None) -> None:
 
     if command == "account-aws":
         app.log_caller_identity()
-    elif command == "check-policy":
-        result = app.check_avoid_delete_policy()
-        account = (app.sts.get_caller_identity().get("Account") or "").strip()
-        logging.info(
-            "Resultado policy '%s': exists=%s | active=%s | arn=%s",
-            result["policy_name"],
-            result["exists"],
-            result["active"],
-            mask_account_in_text(result["policy_arn"], account),
-        )
     elif command == "list-rds":
         clusters = app.list_rds()
         logging.info(

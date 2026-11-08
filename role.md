@@ -1,9 +1,11 @@
 # Role IAM do job de clone Aurora
 
 Orientação para criar a **role/policy** usada pelo container/task que roda o clone.  
-Objetivo: o job consegue clonar PROD → TEMP e gerenciar DEV/TEMP/OLD, mas **não consegue apagar (nem renomear) a base de produção**.
+Objetivo: o job consegue clonar PROD → TEMP e gerenciar DEV/TEMP/OLD com **Allow mínimo**.
 
-> O guard no código (`delete_rds`) é complementar. Sem Deny na IAM, bug, env errado ou rename mal configurado ainda pode apontar para o cluster errado.
+A trava contra apagar a produção é **Deletion protection** no cluster de PROD (console RDS → Modify → Enable deletion protection), não um Deny IAM neste projeto.
+
+> O guard no código (`delete_rds`) é complementar. Confirme Deletion protection na PROD antes de rodar passos que apagam clusters.
 
 ---
 
@@ -11,15 +13,14 @@ Objetivo: o job consegue clonar PROD → TEMP e gerenciar DEV/TEMP/OLD, mas **n�
 
 1. Role **só** para este job — sem `AdministratorAccess` e sem `AmazonRDSFullAccess` na conta.
 2. **Allow** mínimo nas APIs que o pipeline usa (Describe, Restore/PITR, Create, Modify, Delete).
-3. **Deny explícito** de delete (e, se possível, modify destrutivo / rename) nos ARNs de **PROD**.
-4. Preferir restringir Allow por **ARN** ou **tag** (TEMP / DEV / OLD), não por `*`.
-5. Na AWS, manter **Deletion protection = true** no cluster de PROD (camada extra).
+3. Preferir restringir Allow por **ARN** ou **tag** (TEMP / DEV / OLD), não por `*`.
+4. Na AWS, manter **Deletion protection = true** no cluster de PROD.
 
 ---
 
 ## O que o job precisa (Allow)
 
-Ajuste conta, região e identificadores.
+Ajuste conta, região e identificadores. Referência pronta: [`policy-clone-min.json`](policy-clone-min.json).
 
 | Uso no fluxo | Ações RDS típicas | Recursos |
 |---|---|---|
@@ -40,47 +41,25 @@ Se o job grava dumps/logs no S3 (`S3_BUCKET` no `.env`):
 1. Prefira um **bucket dedicado**, Block Public Access **on**, sem ACL pública.
 2. Configure **Lifecycle** para expirar versões atuais em ~**30 dias** (a retenção local no disco é outra: `DUMP_LOCAL_RETENTION_DAYS`, default 15).
 3. Restrinja Put ao prefixo (`S3_DUMP_PREFIX`) quando possível.
-4. O Allow de S3 fica na policy mínima do job (`policy-clone-minimo.json`), não em `make generate-policy`.
+4. O Allow de S3 fica na policy mínima do job ([`policy-clone-min.json`](policy-clone-min.json)).
 
 ---
 
-## O que deve ser bloqueado na PROD (Deny)
+## Deletion protection na PROD
 
-Negue **sempre**, mesmo que algum Allow ampliado exista:
+No console RDS:
 
-- `rds:DeleteDBCluster`
-- `rds:DeleteDBInstance`
-- Idealmente também rename da PROD:
-  - `rds:ModifyDBCluster` (quando muda identificador / remoção de proteção)
-  - `rds:ModifyDBInstance` (idem)
+1. Abra o **cluster** de produção (`PROD_IDENTIFIER`).
+2. **Modify** → marque **Enable deletion protection**.
+3. Aplique a alteração.
 
-Escopo do Deny: ARN do **cluster** e da **instância** de produção (e variants se houver reader).
-
-Exemplo de ARN:
-
-```text
-arn:aws:rds:<REGION>:<ACCOUNT_ID>:cluster:<PROD_CLUSTER_ID>
-arn:aws:rds:<REGION>:<ACCOUNT_ID>:db:<PROD_INSTANCE_ID>
-```
-
-No projeto de referência atual:
-
-- Cluster PROD: `mysqlmanageasyv2-aurora-cluster`
-- Instância PROD: `mysqlmanageasyv2-aurora`
-
-Substitua pelos IDs da sua conta antes de aplicar.
+Com isso, `DeleteDBCluster` / `DeleteDBInstance` na PROD falham até a proteção ser desligada manualmente. Deletion protection **não** bloqueia rename da PROD; mantenha `PROD_IDENTIFIER` correto no `.env` e Allow de Modify só em TEMP/DEV/OLD quando restringir por ARN.
 
 ---
 
-## Modelo de policy (esqueleto)
+## Modelo de policy (esqueleto Allow)
 
-Gere a policy com os ARNs reais da conta via:
-
-```bash
-make generate-policy
-```
-
-Isso usa STS + `PROD_IDENTIFIER` e escreve `policy.json` só com o Deny de delete/rename na PROD (policy `AvoidDeleteAuroraCloneBoto3`). Os Allows do job ficam em `policy-clone-minimo.json`. O JSON abaixo é o esqueleto completo de referência, se for montar Allows e Deny na mesma policy à mão.
+Esqueleto de referência se for montar a policy à mão (ou use [`policy-clone-min.json`](policy-clone-min.json)):
 
 ```json
 {
@@ -127,20 +106,6 @@ Isso usa STS + `PROD_IDENTIFIER` e escreve `policy.json` só com o Deny de delet
       ]
     },
     {
-      "Sid": "DenyDeleteOrRenameProd",
-      "Effect": "Deny",
-      "Action": [
-        "rds:DeleteDBCluster",
-        "rds:DeleteDBInstance",
-        "rds:ModifyDBCluster",
-        "rds:ModifyDBInstance"
-      ],
-      "Resource": [
-        "arn:aws:rds:REGION:ACCOUNT_ID:cluster:PROD_CLUSTER_ID",
-        "arn:aws:rds:REGION:ACCOUNT_ID:db:PROD_INSTANCE_ID"
-      ]
-    },
-    {
       "Sid": "ReadDbPasswordFromSsm",
       "Effect": "Allow",
       "Action": [
@@ -159,16 +124,15 @@ Se o parâmetro for **SecureString**, a role também precisa de `kms:Decrypt` na
 
 Notas:
 
-- O Deny de `Modify*` na PROD impede rename acidental da produção. O clone (`RestoreDBClusterToPointInTime`) **não** precisa de Modify na PROD.
-- Se o Allow de Create/Delete usar tags (`aws:ResourceTag/...`), mantenha o Deny por ARN da PROD mesmo assim.
+- O clone (`RestoreDBClusterToPointInTime`) **não** precisa de Modify na PROD.
 - O statement SSM cobre `DB_PASSWORD_SSM_PARAM` quando `DB_PASSWORD` não está no env; ajuste o ARN ao path real.
-- Se `S3_BUCKET` estiver setada, o Allow de PutObject (e multipart) fica em `policy-clone-minimo.json`. `make generate-policy` não inclui S3.
+- Se `S3_BUCKET` estiver setada, o Allow de PutObject (e multipart) fica em [`policy-clone-min.json`](policy-clone-min.json).
 
 ---
 
 ## Como anexar a role
 
 1. Crie a role de execução do job (ex.: task role ECS / role do host / IRSA).
-2. Anexe a policy acima (managed customer ou inline).
+2. Anexe a policy Allow ([`policy-clone-min.json`](policy-clone-min.json) ou o esqueleto acima).
 3. Garanta que o processo **não** use access key de usuário admin — só essa role.
 4. Confirme Deletion protection no cluster PROD no console RDS.

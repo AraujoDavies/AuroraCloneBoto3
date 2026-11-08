@@ -150,13 +150,9 @@ Confirma Account, ARN e região carregados a partir do `.env`:
 make PYTHON=python account-aws
 ```
 
-### 2. Verificar a policy de proteção
+### 2. Deletion protection na PROD
 
-Checa se a policy IAM `AvoidDeleteAuroraCloneBoto3` existe e está anexada à identity atual. Sem isso, não avance para passos que criam/renomeiam/apagaram recursos. Detalhes da role: [`role.md`](role.md).
-
-```bash
-make PYTHON=python check-policy
-```
+Antes de clonar, renomear ou apagar clusters, no console RDS abra o cluster de **PROD** → **Modify** → ligue **Enable deletion protection** → aplique. Isso bloqueia delete acidental da produção. A role do job (Allow mínimo) está em [`role.md`](role.md) e [`policy-clone-min.json`](policy-clone-min.json).
 
 ### 3. Listar clusters RDS
 
@@ -409,7 +405,7 @@ No fim de `make pipeline` (e na etapa **ArchiveS3** do game), se `S3_BUCKET` est
 | `S3_BUCKET` | Bucket de arquivo dos runs | Upload no fim da pipeline / etapa ArchiveS3 | Sem upload (ArchiveS3 conclui como “pulado”) |
 | `S3_DUMP_PREFIX` | Prefixo de chave S3 (ex.: `aurora-clone/dev`) | Objetos em `s3://bucket/prefix/YYYYMMDD_HHMMSS/…` | Objetos em `s3://bucket/YYYYMMDD_HHMMSS/…` |
 
-**Recomendação:** criar um **bucket dedicado** (não misturar com assets públicos), com **Block Public Access** ligado e **S3 Lifecycle** expirando objetos atuais em ~**30 dias**. A retenção local (`DUMP_LOCAL_RETENTION_DAYS`, default 15) é independente do lifecycle do bucket. Inclua `s3:PutObject` (e multipart) na role do job quando `S3_BUCKET` estiver setada (ver `policy-clone-minimo.json`). `make generate-policy` gera só o Deny da PROD (`AvoidDeleteAuroraCloneBoto3`).
+**Recomendação:** criar um **bucket dedicado** (não misturar com assets públicos), com **Block Public Access** ligado e **S3 Lifecycle** expirando objetos atuais em ~**30 dias**. A retenção local (`DUMP_LOCAL_RETENTION_DAYS`, default 15) é independente do lifecycle do bucket. Inclua `s3:PutObject` (e multipart) na role do job quando `S3_BUCKET` estiver setada (ver [`policy-clone-min.json`](policy-clone-min.json)).
 
 ### Segurança operacional
 
@@ -438,7 +434,6 @@ No container: `make PYTHON=python <alvo>`. No host com Poetry: `make <alvo>` (de
 |------|-----------|
 | `make help` | Ajuda do script (`aurora_clone.py --help`) |
 | `make account-aws` | Account/Arn AWS em uso |
-| `make check-policy` | Policy `AvoidDeleteAuroraCloneBoto3` |
 | `make list-rds` | Inventário de clusters/instâncias RDS |
 | `make clone-prod-to-temp` | 1. Clone PROD → TEMP |
 | `make dump-dev` | 2. Dump schemas DEV |

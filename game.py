@@ -3,13 +3,13 @@ Operação Aurora — campanha narrativa no terminal (MVP).
 
 Três fases, avanço 100% manual (hub → Enter inicia etapa → volta ao hub).
 
-  01 Reconhecimento — pré-voo (tools, AWS, RDS, policy, senha; .env sob demanda)
+  01 Reconhecimento — pré-voo (tools, AWS, RDS, senha; .env sob demanda)
   02 Escalada       — clone → sanitize → dump → restore → validate → renames
   03 Aurora         — delete OLD (+ animação) → archive S3
 
 Uso (container -it):
   make PYTHON=python game
-  python game.py --from shield --no-anim
+  python game.py --from radar --no-anim
 
 Hack (dev): AURORA_GAME_HACK=1 python game.py
 """
@@ -391,30 +391,6 @@ def _check_whoami(app: AuroraClone | None) -> str | None:
     )
 
 
-def _check_shield(app: AuroraClone | None) -> str | None:
-    assert app is not None
-    _require_aws_env()
-    result = app.check_avoid_delete_policy()
-    if not result.get("exists"):
-        raise RuntimeError(
-            f"Policy '{result.get('policy_name')}' NÃO encontrada na conta."
-        )
-    if not result.get("active"):
-        raise RuntimeError(
-            f"Policy '{result.get('policy_name')}' existe mas NÃO está "
-            "anexada à identity atual (active=False)."
-        )
-    account = (app.sts.get_caller_identity().get("Account") or "").strip()
-    write(c(f"  [ OK ] Policy: {result.get('policy_name')}", GREEN))
-    write(
-        c(
-            f"         ARN: {mask_account_in_text(result.get('policy_arn'), account)}",
-            DIM,
-        )
-    )
-    return None
-
-
 def _cluster_status(app: AuroraClone, identifier: str) -> str | None:
     if not app._cluster_exists(identifier):
         return None
@@ -568,7 +544,6 @@ def _check_pipe(app: AuroraClone | None) -> str | None:
         "tools",
         "AWS STS",
         "RDS radar",
-        "IAM shield",
         "DB keys",
     ):
         write(c(f"    [ OK ] {line}", GREEN))
@@ -797,26 +772,6 @@ STAGES: list[Stage] = [
             "Os bancos existem na região, mas as variáveis de ambiente "
             "não correspondem. Edite o .env (PROD_IDENTIFIER e/ou "
             "DEV_IDENTIFIER) com o valor correspondente e reinicie o container.",
-        ],
-    ),
-    Stage(
-        id="shield",
-        act=ACT_RECON,
-        title="Shield",
-        mission="Policy AvoidDeleteAuroraCloneBoto3 existe e está anexada.",
-        hints=[
-            "Siga role.md para criar/anexar a policy.",
-            "Credenciais AWS no .env (mesmas do WhoAmI).",
-            "Teste: make PYTHON=python check-policy",
-        ],
-        run=_check_shield,
-        needs_app=True,
-        clear_message="Policy de proteção da PROD ativa",
-        sample_errors=[
-            "Policy 'AvoidDeleteAuroraCloneBoto3' NÃO encontrada na conta.",
-            "Faltam variáveis de ambiente no .env: AWS_ACCESS_KEY_ID, "
-            "AWS_SECRET_ACCESS_KEY. Edite o .env e use [r] retry "
-            "(sem reiniciar o container).",
         ],
     ),
     Stage(

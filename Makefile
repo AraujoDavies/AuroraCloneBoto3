@@ -7,7 +7,7 @@ SCRIPT := aurora_clone.py
 
 .DEFAULT_GOAL := help
 
-.PHONY: help account-aws check-policy generate-policy list-rds \
+.PHONY: help account-aws list-rds \
 	clone-prod-to-temp sanitize-temp dump-dev restore-temp validate \
 	rename-dev-to-old rename-temp-to-dev delete-old-dev \
 	pipeline run game
@@ -16,7 +16,6 @@ help:
 	$(PYTHON) $(SCRIPT) --help
 	@echo ""
 	@echo "Alvos Make extras:"
-	@echo "  make generate-policy   Gera policy.json (Deny na PROD, ARNs via STS + .env)"
 	@echo "  make game              Operação Aurora (campanha; TTY no container -it)"
 
 requirements-txt:
@@ -24,12 +23,6 @@ requirements-txt:
 
 account-aws:
 	$(PYTHON) $(SCRIPT) account-aws
-
-check-policy:
-	$(PYTHON) $(SCRIPT) check-policy
-
-generate-policy:
-	$(PYTHON) generate_policy.py
 
 list-rds:
 	$(PYTHON) $(SCRIPT) list-rds
