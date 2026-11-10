@@ -1,6 +1,6 @@
-# Aurora Clone (Boto3)
+Com preguiça de ler o README? Assiste o tutorial: https://www.youtube.com/watch?v=_wQmYLTlaM8
 
-Tá com preguiça de ler o README? Assiste o tutorial: https://www.youtube.com/watch?v=_wQmYLTlaM8
+# Aurora Clone (Boto3)
 
 Ajuda a manter a base de **desenvolvimento** o mais próxima possível da de **produção**, sem perder schemas/dados específicos do DEV e sem expor a PROD a rename/delete.
 
