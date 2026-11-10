@@ -1,14 +1,16 @@
 # Aurora Clone (Boto3)
 
+Tá com preguiça de ler o README? Assiste o tutorial: https://www.youtube.com/watch?v=_wQmYLTlaM8
+
 Ajuda a manter a base de **desenvolvimento** o mais próxima possível da de **produção**, sem perder schemas/dados específicos do DEV e sem expor a PROD a rename/delete.
 
-Feito para bancos Aurora/MySQL ou Aurora/PostgreSQL **pesados** (vários **GB** de dados), em que dump/restore completo de PROD é caro ou inviável no dia a dia. O fluxo usa clone copy-on-write (PROD → TEMP), reaplica só o dump dos schemas DEV no TEMP, valida contagens, faz o cutover por rename (DEV→OLD, TEMP→DEV) e remove o OLD — com inventário RDS, guards no código e policy IAM de proteção à PROD.
+Feito para bancos Aurora/MySQL ou Aurora/PostgreSQL **pesados** (vários **GB** de dados), em que dump/restore completo de PROD é caro ou inviável no dia a dia. O fluxo usa clone copy-on-write (PROD → TEMP), reaplica só o dump dos schemas DEV no TEMP, valida contagens, faz o cutover por rename (DEV→OLD, TEMP→DEV) e remove o OLD — com inventário RDS, guards no código e deletion protection no cluster de PROD.
 
 <table>
   <tr>
     <td align="center" width="33%">
       <img src="imgs/1-inventario.png" alt="1. Inventário e guards" width="280" /><br />
-      <sub><b>1. Inventário e guards</b><br />Lista PROD/DEV/TEMP; bloqueia rename/delete em PROD</sub>
+      <sub><b>1. Inventário e guards</b><br />Lista PROD/DEV/TEMP; Com policy mínima.</sub>
     </td>
     <td align="center" width="33%">
       <img src="imgs/2-clone.png" alt="2. Clone copy-on-write" width="280" /><br />
@@ -39,7 +41,7 @@ Feito para bancos Aurora/MySQL ou Aurora/PostgreSQL **pesados** (vários **GB** 
 >
 > - **MasterUsername:** deve ser o **mesmo** em PROD e DEV. O job não lê usuário do `.env`; usa o `MasterUsername` do cluster na API RDS (`make list-rds` → `master_user`). No clone PROD → TEMP, o TEMP herda o master da PROD; no cutover isso vira o master do DEV. Se os nomes forem diferentes, apps/runbooks do DEV que usavam o nome antigo quebram.
 > - **Senha:** a de DEV **não** precisa ser igual à de PROD. Passe só a senha operacional de DEV via `DB_PASSWORD` ou `DB_PASSWORD_SSM_PARAM` no `.env`. O job usa essa senha no login do DEV e, após o clone, redefine a senha do master do TEMP para ela. O script **não precisa** (e não deve receber) a senha de produção.
-> - **Proteção de PROD:** mantenha a base de produção bem protegida pela policy IAM (ver [2. Verificar a policy de proteção](#2-verificar-a-policy-de-proteção) e [`role.md`](role.md)). Normalmente, PROD fica em **outra VPC**, evite caminho de rede a partir do container que executa o clone — o job clona via API RDS (copy-on-write), não precisa conectar no MySQL/PostgreSQL de PROD.
+> - **Proteção de PROD:** ligue **Enable deletion protection** no cluster de produção (ver [2. Deletion protection na PROD](#2-deletion-protection-na-prod) e [`role.md`](role.md)). Além disso, recomenda-se uma policy IAM que impeça o usuário de conectar na base de produção e de executar operações de modificação nela. Essa policy não faz parte deste projeto. Normalmente, PROD fica em **outra VPC**, evite caminho de rede a partir do container que executa o clone — o job clona via API RDS (copy-on-write), não precisa conectar no MySQL/PostgreSQL de PROD.
 >
 > Confira PROD vs DEV com `make list-rds` antes do primeiro pipeline.
 
@@ -90,7 +92,7 @@ Quer mais detalhes? Continue pelo [Sumário](#sumário).
 - [Configurando Compose](#configurando-compose)
 - [Makefile (Comandos padronizados)](#makefile-comandos-padronizados)
   - [1. Conferir a conta AWS](#1-conferir-a-conta-aws)
-  - [2. Verificar a policy de proteção](#2-verificar-a-policy-de-proteção)
+  - [2. Deletion protection na PROD](#2-deletion-protection-na-prod)
   - [3. Listar clusters RDS](#3-listar-clusters-rds)
   - [4. Clone PROD → TEMP](#4-clone-prod--temp)
   - [5. Dump dos schemas DEV](#5-dump-dos-schemas-dev)
@@ -153,6 +155,8 @@ make PYTHON=python account-aws
 ### 2. Deletion protection na PROD
 
 Antes de clonar, renomear ou apagar clusters, no console RDS abra o cluster de **PROD** → **Modify** → ligue **Enable deletion protection** → aplique. Isso bloqueia delete acidental da produção. A role do job (Allow mínimo) está em [`role.md`](role.md) e [`policy-clone-min.json`](policy-clone-min.json).
+
+Além do deletion protection, recomenda-se criar uma policy IAM que impeça o usuário de conectar na base de produção e de executar operações de modificação nela. Essa etapa foi removida deste repositório: a policy fica na conta AWS, fora do projeto.
 
 ### 3. Listar clusters RDS
 
